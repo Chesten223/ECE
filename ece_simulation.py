@@ -20,6 +20,9 @@ import os
 import datetime
 import csv
 import json
+import time
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from pygame.math import Vector2
 
@@ -32,8 +35,8 @@ WORLD_SIZE = 512
 INFO_PANEL_WIDTH = 400
 
 # 2. 演化引擎参数
-INITIAL_AGENT_COUNT = 300
-MAX_AGENTS = 600
+INITIAL_AGENT_COUNT = 500  # 增加初始智能体数量
+MAX_AGENTS = 500          # 限制最大智能体数量为500
 MIN_AGENTS_TO_SPAWN = 300
 MUTATION_PROBABILITY = {
     'point': 0.03, 'add_conn': 0.015, 'del_conn': 0.015,
@@ -47,15 +50,28 @@ FIELD_DECAY_RATE = 0.001
 INTERACTION_RANGE = 120.0 
 ENERGY_TRANSFER_EFFICIENCY = 0.9
 K_INTERACTION_FACTOR = 0.01
-MOVEMENT_SPEED_FACTOR = 50.0  # 增大移动速度因子 (原来是30.0)
-MOVEMENT_ENERGY_COST = 0.04   # 略微减少移动能耗 (原来是0.05)
+MOVEMENT_SPEED_FACTOR = 50.0  # 增大移动速度因子
+MOVEMENT_ENERGY_COST = 0.04   # 略微减少移动能耗
 SIGNAL_EMISSION_RADIUS = 20.0 
 BIOTIC_FIELD_SPECIAL_DECAY = 2.0
 AGENT_RADIUS = 2.0
-MILD_REPULSION_RADIUS = 8.0   # 温和排斥力作用范围
-MILD_REPULSION_STRENGTH = 0.6 # 温和排斥力强度
-COLLISION_ITERATIONS = 3      # 碰撞检测迭代次数
-HIGH_DENSITY_THRESHOLD = 5    # 高密度区域的邻居数量阈值
+MILD_REPULSION_RADIUS = 10.0   # 排斥力作用范围
+MILD_REPULSION_STRENGTH = 1.2  # 排斥力强度
+COLLISION_ITERATIONS = 5       # 碰撞检测迭代次数
+HIGH_DENSITY_THRESHOLD = 3     # 高密度区域的邻居数量阈值
+OVERLAP_EMERGENCY_DISTANCE = 0.5  # 紧急情况下的额外排斥距离
+MIN_MOVEMENT_JITTER = 0.02     # 最小随机移动量，确保所有生物都会动
+REPULSION_PRIORITY = 2.0       # 排斥力优先级，确保排斥力优先于神经网络输出
+ENERGY_PATCH_RADIUS_MIN = 60.0 # 能量辐射最小范围 (原来是30)
+ENERGY_PATCH_RADIUS_MAX = 120.0 # 能量辐射最大范围 (原来是60)
+ENERGY_GRADIENT_FACTOR = 0.6   # 能量梯度因子，越小梯度越缓
+
+# 4. 性能优化参数
+MAX_THREADS = max(4, multiprocessing.cpu_count() - 1)  # 使用CPU核心数-1的线程数
+BATCH_SIZE = 100  # 每个批次处理的智能体数量
+GRID_CELL_SIZE_FACTOR = 1.2  # 网格大小因子，用于空间划分优化
+PERFORMANCE_MONITOR = True  # 启用性能监控
+UPDATE_INTERVAL = 60  # 性能统计更新间隔（帧数）
 
 # --- 数据日志系统 ---
 class DataLogger:
@@ -154,7 +170,7 @@ class Field:
         self.grid = np.zeros((size, size), dtype=np.float32)
 
     def update(self, dt):
-        # 移除扩散，只保留衰减
+        # 移除扩散，只保留衰减 - 使用向量化操作提高性能
         self.grid *= (1 - FIELD_DECAY_RATE * dt)
         # 确保场值在0-1范围内
         np.clip(self.grid, 0, 1, out=self.grid)
@@ -187,9 +203,9 @@ class Field:
         x_coords_masked = full_x_coords[mask]
         y_coords_masked = full_y_coords[mask]
         
-        # 计算梯度值（基于到中心的距离）
+        # 计算梯度值（基于到中心的距离）- 使用更缓和的梯度
         distances = np.sqrt(x_coords_masked**2 + y_coords_masked**2)
-        gradient_values = value * np.maximum(0, 1 - distances / radius)
+        gradient_values = value * np.maximum(0, 1 - (distances / radius) ** ENERGY_GRADIENT_FACTOR)
 
         # 应用周期性边界条件
         x_indices_abs = (x_center + x_coords_masked) % self.size
@@ -380,7 +396,7 @@ class Agent:
                 if i < len(perception_vector):
                     self.node_activations[i] = perception_vector[i]
         
-        # 执行计算步骤（由基因决定的深度）
+        # 执行计算步骤（由基因决定的深度）- 使用矩阵运算提高效率
         for _ in range(self.computation_depth):
             # 计算新的激活值
             inputs = np.dot(self.connection_matrix.T, self.node_activations)
@@ -422,51 +438,115 @@ class Agent:
                 self.env_absorption_coeff = activation * 0.1 + self.gene.get('env_absorption_coeff', 0.5)
             # 'special'节点不执行明确动作，但其值会传递给其他节点
         
+        # 确保所有生物都有最小移动量
+        if move_vector.length_squared() < MIN_MOVEMENT_JITTER**2:
+            move_vector.x += random.uniform(-MIN_MOVEMENT_JITTER, MIN_MOVEMENT_JITTER)
+            move_vector.y += random.uniform(-MIN_MOVEMENT_JITTER, MIN_MOVEMENT_JITTER)
+        
         # 2. 移动
         self.position += move_vector * dt * MOVEMENT_SPEED_FACTOR
 
-        # 3. 添加温和排斥力（强度远低于原设计）
+        # 3. 添加温和排斥力
         repulsion_vector = Vector2(0, 0)
         close_neighbors_count = 0
+        overlapping_neighbors = 0
         
+        # 收集所有邻居信息，以便更好地处理重叠
+        neighbor_data = []
         for other in neighbors:
             if other is self: 
                 continue
             dist_vec = self.position - other.position
             dist_sq = dist_vec.length_squared()
+            min_dist = self.radius + other.radius
+            
+            # 收集邻居数据
+            neighbor_data.append({
+                'agent': other,
+                'dist_vec': dist_vec,
+                'dist_sq': dist_sq,
+                'min_dist': min_dist,
+                'is_overlapping': dist_sq < min_dist**2
+            })
+            
+            # 检测是否有重叠
+            if dist_sq < min_dist**2:
+                overlapping_neighbors += 1
+            
             if dist_sq < MILD_REPULSION_RADIUS**2:
                 close_neighbors_count += 1
                 if dist_sq > 1e-6:  # 避免除以零
                     # 使用更温和的排斥力计算
                     repulsion_strength = 1.0 - (math.sqrt(dist_sq) / MILD_REPULSION_RADIUS)
+                    # 距离越近，排斥力越强（非线性增强）
+                    if dist_sq < min_dist**2:
+                        repulsion_strength *= 2.0  # 重叠时加倍排斥力
                     repulsion_vector += dist_vec.normalize() * repulsion_strength
         
         # 应用温和排斥力，高密度区域增强排斥
         if close_neighbors_count > 0:
             density_factor = 1.0
             if close_neighbors_count > HIGH_DENSITY_THRESHOLD:
-                # 高密度区域增强排斥力
-                density_factor = 1.0 + (close_neighbors_count - HIGH_DENSITY_THRESHOLD) * 0.1
-            self.position += repulsion_vector * MILD_REPULSION_STRENGTH * density_factor * dt
-
-        # 4. 严格碰撞解决（多次迭代）
-        for _ in range(COLLISION_ITERATIONS):
+                # 高密度区域增强排斥力 - 使用非线性增强
+                density_factor = 1.0 + (close_neighbors_count - HIGH_DENSITY_THRESHOLD) ** 1.5 * 0.1
+            
+            # 确保排斥力优先于神经网络的移动决策
+            repulsion_move = repulsion_vector * MILD_REPULSION_STRENGTH * density_factor * dt
+            
+            # 如果排斥力和移动向量方向相反，优先考虑排斥力
+            if move_vector.dot(repulsion_vector) < 0:
+                # 当排斥力和移动向量冲突时，增强排斥力的影响
+                self.position += repulsion_move * REPULSION_PRIORITY
+            else:
+                self.position += repulsion_move
+        
+        # 紧急处理严重重叠情况 - 对于高密度区域增强处理
+        if overlapping_neighbors > 0:  # 只要有重叠就处理
+            # 计算远离所有重叠邻居的方向
+            escape_vector = Vector2(0, 0)
+            for data in neighbor_data:
+                if data['is_overlapping']:
+                    # 距离越近，逃离力越强
+                    escape_strength = 1.0
+                    if data['dist_sq'] > 0:
+                        escape_strength = min(3.0, (data['min_dist']**2) / data['dist_sq'])
+                    escape_vector += data['dist_vec'].normalize() * escape_strength
+            
+            if escape_vector.length_squared() > 0:
+                escape_factor = min(1.0, overlapping_neighbors * 0.3)  # 重叠越多，逃离越强
+                escape_vector = escape_vector.normalize() * OVERLAP_EMERGENCY_DISTANCE * escape_factor
+                self.position += escape_vector
+        
+        # 4. 严格碰撞解决（多次迭代）- 增加对高密度区域的特殊处理
+        for iteration in range(COLLISION_ITERATIONS):
             collision_occurred = False
-            for other in neighbors:
-                if other is self: 
-                    continue
-                dist_vec = self.position - other.position
-                dist_sq = dist_vec.length_squared()
-                min_dist = self.radius + other.radius
-                if dist_sq < min_dist**2 and dist_sq > 0:
+            # 按距离排序，先处理最严重的重叠
+            sorted_neighbors = sorted(neighbor_data, key=lambda x: x['dist_sq'])
+            
+            for data in sorted_neighbors:
+                if data['dist_sq'] < data['min_dist']**2 and data['dist_sq'] > 0:
                     collision_occurred = True
-                    overlap = min_dist - math.sqrt(dist_sq)
+                    overlap = data['min_dist'] - math.sqrt(data['dist_sq'])
                     # 将当前智能体沿碰撞向量推开整个重叠距离
-                    self.position += dist_vec.normalize() * overlap * (1.0 / COLLISION_ITERATIONS)
+                    push_factor = 1.0 + iteration * 0.2  # 每次迭代增加20%的推力
+                    
+                    # 对于严重重叠，增加额外推力
+                    if overlap > data['min_dist'] * 0.5:  # 如果重叠超过半径
+                        push_factor *= 1.5
+                    
+                    # 在高密度区域增加额外推力
+                    if close_neighbors_count > HIGH_DENSITY_THRESHOLD:
+                        push_factor *= (1.0 + (close_neighbors_count - HIGH_DENSITY_THRESHOLD) * 0.1)
+                        
+                    self.position += data['dist_vec'].normalize() * overlap * push_factor * (1.0 / COLLISION_ITERATIONS)
             
             # 如果没有碰撞发生，提前退出循环
             if not collision_occurred:
                 break
+                
+        # 确保在世界边界内
+        self.position.x = max(0, min(WORLD_SIZE, self.position.x))
+        self.position.y = max(0, min(WORLD_SIZE, self.position.y))
 
         # 5. 世界边界环绕
         self.position.x %= WORLD_SIZE
@@ -534,6 +614,53 @@ class Agent:
     def reproduce(self):
         # 繁殖检查：能量必须达到繁殖阈值
         if self.energy < self.e_repro:
+            return None
+
+        # 获取所有可能的周围智能体
+        neighbors = self.universe.get_neighbors(self)
+        
+        # 尝试找到一个没有重叠的位置
+        max_attempts = 20  # 增加尝试次数从10到20
+        child_pos = None
+        min_safe_distance = self.radius * 3.0  # 增加安全距离从2倍半径+1到3倍半径
+        
+        # 缓存所有智能体位置，不仅仅是直接邻居
+        all_positions = []
+        for agent in self.universe.agents:
+            if agent is not self and not agent.is_dead:
+                all_positions.append(agent.position)
+        
+        for _ in range(max_attempts):
+            # 生成一个候选位置
+            angle = random.uniform(0, 2 * math.pi)
+            distance = random.uniform(self.radius * 3.0, self.radius * 8.0)  # 确保至少在3倍半径距离外
+            candidate_pos = Vector2(
+                self.position.x + math.cos(angle) * distance,
+                self.position.y + math.sin(angle) * distance
+            )
+            
+            # 对周期性边界条件进行修正
+            candidate_pos.x %= WORLD_SIZE
+            candidate_pos.y %= WORLD_SIZE
+            
+            # 检查这个位置是否会与任何其他智能体重叠
+            is_valid = True
+            for pos in all_positions:
+                # 考虑周期性边界条件计算距离
+                dx = min(abs(candidate_pos.x - pos.x), WORLD_SIZE - abs(candidate_pos.x - pos.x))
+                dy = min(abs(candidate_pos.y - pos.y), WORLD_SIZE - abs(candidate_pos.y - pos.y))
+                dist_sq = dx * dx + dy * dy
+                
+                if dist_sq < min_safe_distance * min_safe_distance:
+                    is_valid = False
+                    break
+            
+            if is_valid:
+                child_pos = candidate_pos
+                break
+        
+        # 如果找不到合适的位置，则不繁殖
+        if child_pos is None:
             return None
 
         # 消耗能量创建后代
@@ -752,8 +879,7 @@ class Agent:
         # 检查是否发生了突变
         is_mutant_child = len(mutations_occurred) > 0
         
-        # 创建子代
-        child_pos = self.position + Vector2(random.uniform(-5, 5), random.uniform(-5, 5))
+        # 创建子代（使用找到的无重叠位置）
         child = Agent(self.universe, self.logger, gene=new_gene, position=child_pos, 
                      energy=self.e_child, parent_id=self.id, is_mutant=is_mutant_child)
         
@@ -836,7 +962,7 @@ class Universe:
         self.camera = Camera(render_width, render_height)
         
         # 初始化空间网格（用于邻居查找优化）
-        self.grid_cell_size = INTERACTION_RANGE * 1.1
+        self.grid_cell_size = INTERACTION_RANGE * GRID_CELL_SIZE_FACTOR
         self.spatial_grid = defaultdict(list)
         
         # 基因型注册表
@@ -846,15 +972,91 @@ class Universe:
         # 封闭能量系统：在模拟开始时一次性投放能量
         self._initial_energy_seeding()
         
-        # 创建初始智能体
-        self.agents = [Agent(self, self.logger) for _ in range(INITIAL_AGENT_COUNT)]
+        # 创建初始智能体 - 确保位置不重叠
+        self.agents = []
+        min_safe_distance = AGENT_RADIUS * 3.0  # 安全距离
+        occupied_positions = []
+        
+        # 创建指定数量的初始智能体
+        for _ in range(INITIAL_AGENT_COUNT):
+            valid_position = False
+            max_attempts = 50  # 每个智能体尝试位置的最大次数
+            
+            for _ in range(max_attempts):
+                # 生成随机位置
+                candidate_pos = Vector2(
+                    random.uniform(0, WORLD_SIZE),
+                    random.uniform(0, WORLD_SIZE)
+                )
+                
+                # 检查是否与现有智能体重叠
+                valid_position = True
+                
+                for existing_pos in occupied_positions:
+                    # 考虑周期性边界条件计算距离
+                    dx = min(abs(candidate_pos.x - existing_pos.x), WORLD_SIZE - abs(candidate_pos.x - existing_pos.x))
+                    dy = min(abs(candidate_pos.y - existing_pos.y), WORLD_SIZE - abs(candidate_pos.y - existing_pos.y))
+                    dist_sq = dx * dx + dy * dy
+                    
+                    if dist_sq < min_safe_distance * min_safe_distance:
+                        valid_position = False
+                        break
+                
+                # 如果找到有效位置，创建智能体
+                if valid_position:
+                    # 创建新智能体并添加到列表
+                    agent = Agent(self, self.logger, position=candidate_pos)
+                    self.agents.append(agent)
+                    occupied_positions.append(candidate_pos)
+                    break
+            
+            # 如果无法找到有效位置，记录警告并尝试使用更小的安全距离
+            if not valid_position and min_safe_distance > AGENT_RADIUS:
+                min_safe_distance *= 0.9  # 逐步减小安全距离
+                self.logger.log_event(0, 'SPAWN_WARNING', 
+                                    {'message': f'Reducing safe distance to {min_safe_distance:.2f}'})
+                
+                # 再次尝试创建智能体
+                for _ in range(max_attempts):
+                    candidate_pos = Vector2(
+                        random.uniform(0, WORLD_SIZE),
+                        random.uniform(0, WORLD_SIZE)
+                    )
+                    
+                    valid_position = True
+                    for existing_pos in occupied_positions:
+                        dx = min(abs(candidate_pos.x - existing_pos.x), WORLD_SIZE - abs(candidate_pos.x - existing_pos.x))
+                        dy = min(abs(candidate_pos.y - existing_pos.y), WORLD_SIZE - abs(candidate_pos.y - existing_pos.y))
+                        dist_sq = dx * dx + dy * dy
+                        
+                        if dist_sq < min_safe_distance * min_safe_distance:
+                            valid_position = False
+                            break
+                    
+                    if valid_position:
+                        agent = Agent(self, self.logger, position=candidate_pos)
+                        self.agents.append(agent)
+                        occupied_positions.append(candidate_pos)
+                        break
+        
+        # 记录实际创建的智能体数量
+        actual_count = len(self.agents)
+        if actual_count < INITIAL_AGENT_COUNT:
+            self.logger.log_event(0, 'SPAWN_WARNING', 
+                                {'message': f'Only created {actual_count}/{INITIAL_AGENT_COUNT} agents due to space constraints'})
+        
+        # 初始化线程池
+        self.thread_pool = ThreadPoolExecutor(max_workers=MAX_THREADS)
+        
+        # 性能监控
+        self.perf_monitor = PerformanceMonitor() if PERFORMANCE_MONITOR else None
 
     def _initial_energy_seeding(self):
         """在世界中一次性播种初始能量。"""
-        num_patches = 15
+        num_patches = 5  # 减少为5个能量原点
         for _ in range(num_patches):
             pos = Vector2(random.uniform(0, WORLD_SIZE), random.uniform(0, WORLD_SIZE))
-            radius = random.uniform(30, 60)
+            radius = random.uniform(ENERGY_PATCH_RADIUS_MIN, ENERGY_PATCH_RADIUS_MAX)
             self.nutrient_field.add_circular_source(pos, radius, 1.0)
         self.logger.log_event(0, 'INITIAL_ENERGY_SEED', {'patches': num_patches})
 
@@ -905,8 +1107,8 @@ class Universe:
     
     def on_agent_death(self, agent):
         """处理智能体死亡事件"""
-        # 死亡时，释放残余能量回馈到环境中
-        self.nutrient_field.add_circular_source(agent.position, agent.e_res / 4, 0.8)
+        # 移除死亡时释放残余能量回馈到环境中的功能
+        pass
 
     def update_spatial_grid(self):
         """更新空间网格（用于邻居查找）"""
@@ -934,41 +1136,107 @@ class Universe:
                 
         return neighbors
 
-    def update(self, dt):
-        """更新宇宙状态"""
-        self.frame_count += 1
-        
-        # 更新所有场
-        for field in self.fields:
-            field.update(dt)
-        
-        # 生物场的特殊衰减（信号更快消失）
-        self.biotic_field_1.grid *= (1 - BIOTIC_FIELD_SPECIAL_DECAY * dt)
-        self.biotic_field_2.grid *= (1 - BIOTIC_FIELD_SPECIAL_DECAY * dt)
+    def _update_agent_batch(self, agent_batch, dt):
+        """更新一批智能体（用于并行处理）"""
+        for agent in agent_batch:
+            if not agent.is_dead:
+                neighbors = self.get_neighbors(agent)
+                agent.update(dt, neighbors)
+        return [agent for agent in agent_batch if not agent.is_dead]
 
-        # 更新空间网格和智能体
-        self.update_spatial_grid()
-        for agent in self.agents:
-            agent.update(dt, self.get_neighbors(agent))
-        
-        # 处理繁殖
+    def _process_reproduction(self, agents):
+        """处理一批智能体的繁殖（用于并行处理）"""
         new_children = []
-        for agent in list(self.agents):
+        for agent in agents:
             if not agent.is_dead:
                 child = agent.reproduce()
                 if child:
                     new_children.append(child)
+        return new_children
 
-        # 移除死亡的智能体
-        self.agents = [agent for agent in self.agents if not agent.is_dead]
+    def _update_fields_parallel(self, dt):
+        """并行更新所有场"""
+        futures = []
+        for field in self.fields:
+            futures.append(self.thread_pool.submit(field.update, dt))
+        
+        # 等待所有场更新完成
+        for future in futures:
+            future.result()
+        
+        # 生物场的特殊衰减（信号更快消失）- 使用向量化操作
+        self.biotic_field_1.grid *= (1 - BIOTIC_FIELD_SPECIAL_DECAY * dt)
+        self.biotic_field_2.grid *= (1 - BIOTIC_FIELD_SPECIAL_DECAY * dt)
+
+    def update(self, dt):
+        """更新宇宙状态"""
+        if self.perf_monitor:
+            self.perf_monitor.start_update()
+            
+        self.frame_count += 1
+        
+        # 并行更新所有场
+        self._update_fields_parallel(dt)
+
+        # 更新空间网格
+        self.update_spatial_grid()
+        
+        # 将智能体分成批次进行并行处理
+        updated_agents = []
+        agent_batches = [self.agents[i:i+BATCH_SIZE] for i in range(0, len(self.agents), BATCH_SIZE)]
+        
+        # 使用线程池并行处理智能体更新
+        future_results = [self.thread_pool.submit(self._update_agent_batch, batch, dt) for batch in agent_batches]
+        for future in future_results:
+            updated_agents.extend(future.result())
+        
+        self.agents = updated_agents
+        
+        # 并行处理繁殖
+        future_results = [self.thread_pool.submit(self._process_reproduction, batch) for batch in agent_batches]
+        new_children = []
+        for future in future_results:
+            new_children.extend(future.result())
         
         # 添加新出生的智能体
         self.agents.extend(new_children)
 
         # 如果智能体数量过少，补充一些新的随机智能体
         if len(self.agents) < MIN_AGENTS_TO_SPAWN and self.frame_count % 10 == 0:
+            new_agents = []
             for _ in range(10):
-                self.agents.append(Agent(self, self.logger))
+                # 尝试找到一个不重叠的位置
+                max_attempts = 30  # 增加尝试次数
+                new_pos = None
+                min_safe_distance = AGENT_RADIUS * 3.0  # 增加安全距离
+                
+                # 缓存所有现有智能体位置
+                existing_positions = [agent.position for agent in self.agents if not agent.is_dead]
+                
+                for _ in range(max_attempts):
+                    candidate_pos = Vector2(random.uniform(0, WORLD_SIZE), random.uniform(0, WORLD_SIZE))
+                    
+                    # 检查是否与现有智能体重叠
+                    is_valid = True
+                    for pos in existing_positions:
+                        # 考虑周期性边界条件计算距离
+                        dx = min(abs(candidate_pos.x - pos.x), WORLD_SIZE - abs(candidate_pos.x - pos.x))
+                        dy = min(abs(candidate_pos.y - pos.y), WORLD_SIZE - abs(candidate_pos.y - pos.y))
+                        dist_sq = dx * dx + dy * dy
+                        
+                        if dist_sq < min_safe_distance * min_safe_distance:
+                            is_valid = False
+                            break
+                    
+                    if is_valid:
+                        new_pos = candidate_pos
+                        break
+                
+                # 只有找到合适位置才创建新智能体
+                if new_pos:
+                    new_agents.append(Agent(self, self.logger, position=new_pos))
+            
+            self.agents.extend(new_agents)
         
         # 如果智能体数量过多，淘汰一些能量最低的
         if len(self.agents) > MAX_AGENTS:
@@ -987,24 +1255,15 @@ class Universe:
         # 定期记录状态
         if self.frame_count % 20 == 0:
             self.logger.log_state(self.frame_count, self.agents)
-
-    def handle_click(self, mouse_pos):
-        """处理鼠标点击事件"""
-        world_pos = self.camera.screen_to_world(mouse_pos)
-        closest_agent = None
-        min_dist_sq = (10 / self.camera.zoom)**2
-        
-        # 查找最近的智能体
-        for agent in self.agents:
-            dist_sq = (agent.position - world_pos).length_squared()
-            if dist_sq < min_dist_sq:
-                min_dist_sq = dist_sq
-                closest_agent = agent
-                
-        self.selected_agent = closest_agent
+            
+        if self.perf_monitor:
+            self.perf_monitor.end_update()
 
     def draw(self, surface, sim_surface):
         """绘制整个宇宙"""
+        if self.perf_monitor:
+            self.perf_monitor.start_render()
+            
         # 背景
         sim_surface.fill((10, 10, 20))
         
@@ -1022,7 +1281,25 @@ class Universe:
             agent.draw(sim_surface, self.camera)
             
         # 将模拟表面绘制到主表面
-        surface.blit(sim_surface, (0, 0)) 
+        surface.blit(sim_surface, (0, 0))
+        
+        if self.perf_monitor:
+            self.perf_monitor.end_render()
+
+    def handle_click(self, mouse_pos):
+        """处理鼠标点击事件"""
+        world_pos = self.camera.screen_to_world(mouse_pos)
+        closest_agent = None
+        min_dist_sq = (10 / self.camera.zoom)**2
+        
+        # 查找最近的智能体
+        for agent in self.agents:
+            dist_sq = (agent.position - world_pos).length_squared()
+            if dist_sq < min_dist_sq:
+                min_dist_sq = dist_sq
+                closest_agent = agent
+                
+        self.selected_agent = closest_agent
 
 # --- UI组件 ---
 def draw_inspector_panel(surface, font, agent, mouse_pos, panel_x, panel_width, panel_height):
@@ -1267,15 +1544,85 @@ def draw_neural_network(surface, font, agent, x, y, width, height, mouse_pos):
         surface.blit(title_surf, (box_rect.x + 10, box_rect.y + 5))
         surface.blit(value_surf, (box_rect.x + 10, box_rect.y + 25))
 
+# --- 性能监控系统 ---
+class PerformanceMonitor:
+    def __init__(self):
+        self.frame_times = []
+        self.update_times = []
+        self.render_times = []
+        self.agent_counts = []
+        self.last_time = time.time()
+        self.last_stats_time = time.time()
+        self.fps = 0
+        self.avg_update_time = 0
+        self.avg_render_time = 0
+        self.cpu_usage = 0
+        
+    def start_frame(self):
+        self.last_time = time.time()
+        
+    def end_frame(self, agent_count):
+        current_time = time.time()
+        frame_time = current_time - self.last_time
+        
+        self.frame_times.append(frame_time)
+        self.agent_counts.append(agent_count)
+        
+        # 保持最近100帧的数据
+        if len(self.frame_times) > 100:
+            self.frame_times.pop(0)
+            self.agent_counts.pop(0)
+        
+        # 计算FPS
+        if self.frame_times:
+            self.fps = 1.0 / (sum(self.frame_times) / len(self.frame_times))
+    
+    def start_update(self):
+        self.update_start_time = time.time()
+    
+    def end_update(self):
+        update_time = time.time() - self.update_start_time
+        self.update_times.append(update_time)
+        if len(self.update_times) > 100:
+            self.update_times.pop(0)
+        self.avg_update_time = sum(self.update_times) / len(self.update_times)
+    
+    def start_render(self):
+        self.render_start_time = time.time()
+    
+    def end_render(self):
+        render_time = time.time() - self.render_start_time
+        self.render_times.append(render_time)
+        if len(self.render_times) > 100:
+            self.render_times.pop(0)
+        self.avg_render_time = sum(self.render_times) / len(self.render_times)
+    
+    def get_stats(self):
+        return {
+            'fps': round(self.fps, 1),
+            'agents': self.agent_counts[-1] if self.agent_counts else 0,
+            'update_ms': round(self.avg_update_time * 1000, 1),
+            'render_ms': round(self.avg_render_time * 1000, 1)
+        }
+
 def main():
     """主函数"""
     # 设置窗口位置居中
     os.environ['SDL_VIDEO_CENTERED'] = '1'
     
-    # 初始化Pygame
+    # 设置Pygame以提高性能
     pygame.init()
-    screen = pygame.display.set_mode((INITIAL_SCREEN_WIDTH, INITIAL_SCREEN_HEIGHT), pygame.RESIZABLE)
-    pygame.display.set_caption("涌现认知生态系统 (ECE) v5.0 - 封闭生态版")
+    pygame.display.set_caption("涌现认知生态系统 (ECE) v5.0 - 高性能版")
+    
+    # 设置显示模式
+    flags = pygame.HWSURFACE | pygame.DOUBLEBUF | pygame.RESIZABLE
+    screen = pygame.display.set_mode((INITIAL_SCREEN_WIDTH, INITIAL_SCREEN_HEIGHT), flags)
+    
+    # 使用硬件加速
+    if pygame.display.get_driver() == 'windows':
+        # 在Windows上尝试使用DirectX
+        os.environ['SDL_VIDEODRIVER'] = 'directx'
+    
     clock = pygame.time.Clock()
     
     # 设置字体
@@ -1300,9 +1647,13 @@ def main():
     # 控制变量
     running = True
     paused = False
+    last_performance_update = 0
     
     # 主循环
     while running:
+        if universe.perf_monitor:
+            universe.perf_monitor.start_frame()
+            
         mouse_pos = pygame.mouse.get_pos()
         
         # 事件处理
@@ -1350,8 +1701,9 @@ def main():
         
         # 非暂停状态下更新模拟
         if not paused:
-            dt = min(clock.tick(60) / 1000.0, 0.1)  # 限制最大时间步
-            universe.update(dt)
+            # 使用固定的时间步长，提高模拟稳定性
+            fixed_dt = 0.016  # 约60FPS
+            universe.update(fixed_dt)
         
         # 清除屏幕
         screen.fill((0,0,0))
@@ -1379,14 +1731,33 @@ def main():
         
         # 显示状态信息
         total_biomass = sum(agent.energy for agent in universe.agents)
+        
+        # 性能统计
+        performance_info = ""
+        if universe.perf_monitor and universe.frame_count - last_performance_update > UPDATE_INTERVAL:
+            stats = universe.perf_monitor.get_stats()
+            performance_info = f" | FPS: {stats['fps']} | 更新: {stats['update_ms']}ms | 渲染: {stats['render_ms']}ms"
+            last_performance_update = universe.frame_count
+            
         info_text = f"帧: {universe.frame_count} | 生命体: {len(universe.agents)} ({universe.next_genotype_id}个基因型) | " \
-                   f"总生物量: {int(total_biomass)} | 视图(0-4): {view_name} | {'[已暂停]' if paused else ''}"
+                   f"总生物量: {int(total_biomass)} | 视图(0-4): {view_name}{performance_info} | {'[已暂停]' if paused else ''}"
         text_surface = font.render(info_text, True, (255, 255, 255))
         screen.blit(text_surface, (10, 10))
         
-        # 更新显示
+        # 更新显示 - 使用flip而不是update以利用硬件加速
         pygame.display.flip()
+        
+        # 使用clock.tick()而不是sleep，更精确地控制帧率
+        # 不限制帧率，让CPU尽可能多地工作
+        clock.tick(0)
+        
+        if universe.perf_monitor:
+            universe.perf_monitor.end_frame(len(universe.agents))
 
+    # 关闭线程池
+    if hasattr(universe, 'thread_pool'):
+        universe.thread_pool.shutdown()
+        
     # 退出Pygame
     pygame.quit()
 
