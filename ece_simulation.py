@@ -47,11 +47,15 @@ FIELD_DECAY_RATE = 0.001
 INTERACTION_RANGE = 120.0 
 ENERGY_TRANSFER_EFFICIENCY = 0.9
 K_INTERACTION_FACTOR = 0.01
-DENSITY_REPULSION_RADIUS = 15.0
-DENSITY_REPULSION_STRENGTH = 2.5
+MOVEMENT_SPEED_FACTOR = 50.0  # 增大移动速度因子 (原来是30.0)
+MOVEMENT_ENERGY_COST = 0.04   # 略微减少移动能耗 (原来是0.05)
 SIGNAL_EMISSION_RADIUS = 20.0 
 BIOTIC_FIELD_SPECIAL_DECAY = 2.0
 AGENT_RADIUS = 2.0
+MILD_REPULSION_RADIUS = 8.0   # 温和排斥力作用范围
+MILD_REPULSION_STRENGTH = 0.6 # 温和排斥力强度
+COLLISION_ITERATIONS = 3      # 碰撞检测迭代次数
+HIGH_DENSITY_THRESHOLD = 5    # 高密度区域的邻居数量阈值
 
 # --- 数据日志系统 ---
 class DataLogger:
@@ -150,12 +154,8 @@ class Field:
         self.grid = np.zeros((size, size), dtype=np.float32)
 
     def update(self, dt):
-        # 使用拉普拉斯算子实现扩散
-        laplacian = -4 * self.grid
-        laplacian += np.roll(self.grid, 1, axis=0) + np.roll(self.grid, -1, axis=0)
-        laplacian += np.roll(self.grid, 1, axis=1) + np.roll(self.grid, -1, axis=1)
-        # 应用扩散和衰减
-        self.grid += (FIELD_DIFFUSION_RATE * laplacian - FIELD_DECAY_RATE * self.grid) * dt
+        # 移除扩散，只保留衰减
+        self.grid *= (1 - FIELD_DECAY_RATE * dt)
         # 确保场值在0-1范围内
         np.clip(self.grid, 0, 1, out=self.grid)
 
@@ -335,8 +335,12 @@ class Agent:
         self.e_res = 20 + self.complexity * 0.5  # 死亡后回馈环境的能量
         self.metabolism_cost = 0.15 + 0.0005 * (self.complexity**2)  # 基础代谢成本
         
-        # 基因表达的身份向量（用于相互作用）
-        self.identity_vector = np.mean([c[2] for c in self.gene['connections']]) if self.gene['connections'] else 0
+        # 基因表达的身份向量（用于相互作用和生态位定位）
+        if self.gene['connections']:
+            weights = [c[2] for c in self.gene['connections']]
+            self.identity_vector = np.mean(weights)
+        else:
+            self.identity_vector = 0
         
         # 环境吸收系数
         self.env_absorption_coeff = self.gene.get('env_absorption_coeff', 0.5)
@@ -418,7 +422,10 @@ class Agent:
                 self.env_absorption_coeff = activation * 0.1 + self.gene.get('env_absorption_coeff', 0.5)
             # 'special'节点不执行明确动作，但其值会传递给其他节点
         
-        # 2. 计算密度排斥力
+        # 2. 移动
+        self.position += move_vector * dt * MOVEMENT_SPEED_FACTOR
+
+        # 3. 添加温和排斥力（强度远低于原设计）
         repulsion_vector = Vector2(0, 0)
         close_neighbors_count = 0
         
@@ -427,48 +434,84 @@ class Agent:
                 continue
             dist_vec = self.position - other.position
             dist_sq = dist_vec.length_squared()
-            if dist_sq < DENSITY_REPULSION_RADIUS**2:
+            if dist_sq < MILD_REPULSION_RADIUS**2:
                 close_neighbors_count += 1
                 if dist_sq > 1e-6:  # 避免除以零
-                    repulsion_vector += dist_vec.normalize() / dist_sq
+                    # 使用更温和的排斥力计算
+                    repulsion_strength = 1.0 - (math.sqrt(dist_sq) / MILD_REPULSION_RADIUS)
+                    repulsion_vector += dist_vec.normalize() * repulsion_strength
         
-        # 应用排斥力
-        if close_neighbors_count > 3:
-            move_vector += repulsion_vector * DENSITY_REPULSION_STRENGTH
-        
-        # 3. 移动
-        self.position += move_vector * dt * 30
+        # 应用温和排斥力，高密度区域增强排斥
+        if close_neighbors_count > 0:
+            density_factor = 1.0
+            if close_neighbors_count > HIGH_DENSITY_THRESHOLD:
+                # 高密度区域增强排斥力
+                density_factor = 1.0 + (close_neighbors_count - HIGH_DENSITY_THRESHOLD) * 0.1
+            self.position += repulsion_vector * MILD_REPULSION_STRENGTH * density_factor * dt
 
-        # 4. 严格碰撞解决
-        for other in neighbors:
-            if other is self: 
-                continue
-            dist_vec = self.position - other.position
-            dist_sq = dist_vec.length_squared()
-            min_dist = self.radius + other.radius
-            if dist_sq < min_dist**2 and dist_sq > 0:
-                overlap = min_dist - math.sqrt(dist_sq)
-                # 将当前智能体沿碰撞向量推开整个重叠距离
-                self.position += dist_vec.normalize() * overlap
+        # 4. 严格碰撞解决（多次迭代）
+        for _ in range(COLLISION_ITERATIONS):
+            collision_occurred = False
+            for other in neighbors:
+                if other is self: 
+                    continue
+                dist_vec = self.position - other.position
+                dist_sq = dist_vec.length_squared()
+                min_dist = self.radius + other.radius
+                if dist_sq < min_dist**2 and dist_sq > 0:
+                    collision_occurred = True
+                    overlap = min_dist - math.sqrt(dist_sq)
+                    # 将当前智能体沿碰撞向量推开整个重叠距离
+                    self.position += dist_vec.normalize() * overlap * (1.0 / COLLISION_ITERATIONS)
+            
+            # 如果没有碰撞发生，提前退出循环
+            if not collision_occurred:
+                break
 
         # 5. 世界边界环绕
         self.position.x %= WORLD_SIZE
         self.position.y %= WORLD_SIZE
 
-        # 6. 与邻近智能体的能量交换
+        # 6. 与邻近智能体的能量交换（捕食关系）
         for other in neighbors:
             if other is self or other.is_dead: 
                 continue
             dist_sq = (self.position - other.position).length_squared()
             if dist_sq < INTERACTION_RANGE**2:
-                # 基于基因相似性的能量交换
-                energy_transfer = other.identity_vector * K_INTERACTION_FACTOR * self.identity_vector
-                self.energy += energy_transfer * dt
-                other.energy -= energy_transfer * (1 - ENERGY_TRANSFER_EFFICIENCY) * dt  # 考虑效率损失
+                # 基于身份向量差异的生态位分化捕食关系
+                # 计算身份向量差异的绝对值
+                identity_diff = abs(self.identity_vector - other.identity_vector)
+                
+                # 确定最佳捕食差异 - 设为中等差异值时捕食效率最高
+                # 过于相似（同类）或过于不同（不兼容的生态位）都降低捕食效率
+                OPTIMAL_DIFF = 0.5  # 最佳差异值
+                
+                # 计算捕食效率 - 使用高斯曲线，在最佳差异处达到峰值
+                # 身份差异接近最佳差异时捕食效率最高
+                predation_efficiency = math.exp(-10 * (identity_diff - OPTIMAL_DIFF)**2)
+                
+                # 算法核心：生态位差异适中，并且self身份向量高于other时才能捕食
+                # 这确保了捕食是单向的，避免了互相吞噬
+                if self.identity_vector > other.identity_vector and predation_efficiency > 0.1:
+                    # 距离影响捕食效率
+                    dist_factor = 1 - math.sqrt(dist_sq) / INTERACTION_RANGE
+                    energy_transfer = predation_efficiency * K_INTERACTION_FACTOR * 30 * dist_factor
+                    
+                    # 捕食者获得能量，被捕食者失去能量
+                    self.energy += energy_transfer * dt
+                    other.energy -= energy_transfer * dt
+                    
+                    # 简化的捕食记录
+                    if energy_transfer * dt > 1.0 and random.random() < 0.05:  # 仅记录5%的显著捕食事件，减少日志量
+                        self.universe.logger.log_event(
+                            self.universe.frame_count, 
+                            'PREDATION', 
+                            {'pred_id': self.id, 'prey_id': other.id}
+                        )
 
         # 7. 新陈代谢与环境能量吸收
         # 计算行动消耗 - 考虑所有激活节点的成本
-        action_cost = move_vector.length_squared() * 0.05
+        action_cost = move_vector.length_squared() * MOVEMENT_ENERGY_COST
         signal_cost = sum(abs(a) for a in output_activations) * 0.1
         metabolism = self.metabolism_cost + action_cost + signal_cost
         
@@ -1039,6 +1082,17 @@ def draw_inspector_panel(surface, font, agent, mouse_pos, panel_x, panel_width, 
     draw_text("连接数", len(agent.gene['connections']))
     draw_text("思维深度 (k)", agent.computation_depth)
     draw_text("环境吸收系数", f"{agent.env_absorption_coeff:.2f}")
+    
+    # 生态特性
+    y_offset += 10
+    draw_text("--- 生态特性 ---", "", (200, 100, 200))
+    
+    # 只显示身份向量
+    id_value = round(agent.identity_vector, 2)
+    draw_text("身份向量", f"{id_value:.2f}", 
+             (int(100 + abs(id_value) * 100), 
+              int(100 + (1 - abs(id_value)) * 100), 
+              int(200 - abs(id_value) * 100)))
     
     # 行为输出
     y_offset += 10
