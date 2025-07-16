@@ -22,6 +22,7 @@ import csv
 import json
 import time
 import multiprocessing
+import argparse
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from pygame.math import Vector2
@@ -35,9 +36,9 @@ WORLD_SIZE = 512
 INFO_PANEL_WIDTH = 400
 
 # 2. 演化引擎参数
-INITIAL_AGENT_COUNT = 500  # 增加初始智能体数量
+INITIAL_AGENT_COUNT = 100  # 初始智能体数量设置为100
 MAX_AGENTS = 500          # 限制最大智能体数量为500
-MIN_AGENTS_TO_SPAWN = 300
+MIN_AGENTS_TO_SPAWN = 100  # 如果智能体数量低于100，就补充
 MUTATION_PROBABILITY = {
     'point': 0.03, 'add_conn': 0.015, 'del_conn': 0.015,
     'add_node': 0.007, 'del_node': 0.007,
@@ -1190,7 +1191,8 @@ class Agent:
 
     def draw(self, surface, camera):
         """绘制智能体 - 使用批量渲染和视口裁剪优化"""
-        if self.is_dead:
+        # 在无GUI模式或智能体已死亡时跳过渲染
+        if not self.universe.use_gui or self.is_dead:
             return
             
         # 检查智能体是否在视口内
@@ -1256,8 +1258,9 @@ class Agent:
 
 # --- 宇宙系统 ---
 class Universe:
-    def __init__(self, logger, render_width, render_height):
+    def __init__(self, logger, render_width, render_height, use_gui=True):
         self.logger = logger
+        self.use_gui = use_gui
         
         # 初始化信息场
         self.fields = [
@@ -1273,8 +1276,9 @@ class Universe:
         self.selected_agent = None
         self.view_mode = 1  # 默认显示营养场
         
-        # 初始化相机
-        self.camera = Camera(render_width, render_height)
+        # 初始化相机（仅在GUI模式下使用）
+        if self.use_gui:
+            self.camera = Camera(render_width, render_height)
         
         # 初始化空间网格（用于邻居查找优化）
         self.grid_cell_size = INTERACTION_RANGE * GRID_CELL_SIZE_FACTOR
@@ -1588,8 +1592,8 @@ class Universe:
         # 添加新出生的智能体
         self.agents.extend(new_children)
 
-        # 如果智能体数量过少，补充一些新的随机智能体
-        if len(self.agents) < MIN_AGENTS_TO_SPAWN and self.frame_count % 10 == 0:
+        # 如果智能体数量低于最小阈值，补充新的随机智能体
+        if len(self.agents) < MIN_AGENTS_TO_SPAWN:
             self._spawn_new_agents()
         
         # 如果智能体数量过多，淘汰一些能量最低的
@@ -1605,8 +1609,16 @@ class Universe:
     
     def _spawn_new_agents(self):
         """生成新的随机智能体"""
+        # 计算需要添加的智能体数量，确保达到最小数量
+        agents_to_add = MIN_AGENTS_TO_SPAWN - len(self.agents)
+        if agents_to_add <= 0:
+            return
+            
+        self.logger.log_event(self.frame_count, 'SPAWN_NEW', 
+                             {'count': agents_to_add, 'reason': 'below_minimum'})
+        
         new_agents = []
-        for _ in range(10):
+        for _ in range(agents_to_add):
             # 尝试找到一个不重叠的位置
             max_attempts = 30  # 增加尝试次数
             new_pos = None
@@ -1639,6 +1651,11 @@ class Universe:
                 new_agents.append(Agent(self, self.logger, position=new_pos))
         
         self.agents.extend(new_agents)
+        
+        # 记录实际添加的智能体数量
+        if len(new_agents) < agents_to_add:
+            self.logger.log_event(self.frame_count, 'SPAWN_WARNING', 
+                                {'message': f'只能添加 {len(new_agents)}/{agents_to_add} 个智能体，因为空间限制'})
     
     def _cull_excess_agents(self):
         """淘汰多余的智能体"""
@@ -1656,6 +1673,10 @@ class Universe:
 
     def draw(self, surface, sim_surface):
         """绘制整个宇宙 - 使用批量渲染优化"""
+        # 在无GUI模式下跳过渲染
+        if not self.use_gui:
+            return
+            
         if self.perf_monitor:
             self.perf_monitor.start_render()
             
@@ -2070,43 +2091,58 @@ class PerformanceMonitor:
 
 def main():
     """主函数"""
-    # 设置窗口位置居中
-    os.environ['SDL_VIDEO_CENTERED'] = '1'
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description="涌现认知生态系统 (ECE) v5.0")
+    parser.add_argument("--no-gui", action="store_true", help="无GUI模式，仅运行计算")
+    args = parser.parse_args()
     
-    # 设置Pygame以提高性能
-    pygame.init()
-    pygame.display.set_caption("涌现认知生态系统 (ECE) v5.0 - 高性能版")
+    # 使用GUI模式
+    use_gui = not args.no_gui
     
-    # 设置显示模式
-    flags = pygame.HWSURFACE | pygame.DOUBLEBUF | pygame.RESIZABLE
-    screen = pygame.display.set_mode((INITIAL_SCREEN_WIDTH, INITIAL_SCREEN_HEIGHT), flags)
-    
-    # 使用硬件加速
-    if pygame.display.get_driver() == 'windows':
-        # 在Windows上尝试使用DirectX
-        os.environ['SDL_VIDEODRIVER'] = 'directx'
-    
-    # 移除帧率限制
-    clock = pygame.time.Clock()
-    
-    # 设置字体
-    try: 
-        font = pygame.font.SysFont("simhei", 16)
-    except pygame.error: 
-        font = pygame.font.SysFont(None, 22)
+    # 如果使用GUI模式，初始化pygame
+    if use_gui:
+        # 设置窗口位置居中
+        os.environ['SDL_VIDEO_CENTERED'] = '1'
+        
+        # 设置Pygame以提高性能
+        pygame.init()
+        pygame.display.set_caption("涌现认知生态系统 (ECE) v5.0 - 高性能版")
+        
+        # 设置显示模式
+        flags = pygame.HWSURFACE | pygame.DOUBLEBUF | pygame.RESIZABLE
+        screen = pygame.display.set_mode((INITIAL_SCREEN_WIDTH, INITIAL_SCREEN_HEIGHT), flags)
+        
+        # 使用硬件加速
+        if pygame.display.get_driver() == 'windows':
+            # 在Windows上尝试使用DirectX
+            os.environ['SDL_VIDEODRIVER'] = 'directx'
+        
+        # 移除帧率限制
+        clock = pygame.time.Clock()
+        
+        # 设置字体
+        try: 
+            font = pygame.font.SysFont("simhei", 16)
+        except pygame.error: 
+            font = pygame.font.SysFont(None, 22)
+        
+        # 设置模拟区域大小
+        current_screen_width, current_screen_height = screen.get_size()
+        sim_area_width = current_screen_width - INFO_PANEL_WIDTH
+    else:
+        # 无GUI模式
+        print("以无GUI模式运行，仅进行计算...")
+        sim_area_width = INITIAL_SCREEN_WIDTH - INFO_PANEL_WIDTH
+        current_screen_height = INITIAL_SCREEN_HEIGHT
     
     # 初始化数据记录器
     logger = DataLogger()
     
-    # 设置模拟区域大小
-    current_screen_width, current_screen_height = screen.get_size()
-    sim_area_width = current_screen_width - INFO_PANEL_WIDTH
-    
     # 创建宇宙
-    universe = Universe(logger, sim_area_width, current_screen_height)
+    universe = Universe(logger, sim_area_width, current_screen_height, use_gui)
     
     # 记录模拟开始事件
-    logger.log_event(0, 'SIM_START', {'initial_agents': INITIAL_AGENT_COUNT, 'world_size': WORLD_SIZE})
+    logger.log_event(0, 'SIM_START', {'initial_agents': INITIAL_AGENT_COUNT, 'world_size': WORLD_SIZE, 'gui_mode': use_gui})
     
     # 控制变量
     running = True
@@ -2125,58 +2161,70 @@ def main():
         if universe.perf_monitor and render_this_frame:
             universe.perf_monitor.start_frame()
             
-        mouse_pos = pygame.mouse.get_pos()
-        
-        # 事件处理
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT: 
+        # GUI模式下处理事件
+        if use_gui:
+            mouse_pos = pygame.mouse.get_pos()
+            
+            # 事件处理
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT: 
+                    running = False
+                
+                # 窗口大小调整
+                if event.type == pygame.VIDEORESIZE:
+                    current_screen_width, current_screen_height = event.size
+                
+                # 相机事件处理
+                universe.camera.handle_event(event, mouse_pos)
+                
+                # 鼠标点击
+                if event.type == pygame.MOUSEBUTTONDOWN:
+                    if event.button == 1 and mouse_pos[0] < universe.camera.render_width:
+                        universe.handle_click(event.pos)
+                        
+                # 键盘控制
+                if event.type == pygame.KEYDOWN:
+                    # 空格暂停/继续
+                    if event.key == pygame.K_SPACE: 
+                        paused = not paused
+                        
+                    # 右箭头在暂停时单步执行
+                    if event.key == pygame.K_RIGHT and paused: 
+                        universe.update(0.016)
+                        
+                    # F11全屏切换
+                    if event.key == pygame.K_F11:
+                        pygame.display.toggle_fullscreen()
+                        
+                    # 数字键切换视图模式
+                    if event.key == pygame.K_0:
+                        universe.view_mode = 0
+                    elif event.key == pygame.K_1:
+                        universe.view_mode = 1
+                    elif event.key == pygame.K_2:
+                        universe.view_mode = 2
+                    elif event.key == pygame.K_3:
+                        universe.view_mode = 3
+                    elif event.key == pygame.K_4:
+                        universe.view_mode = 4
+                        
+                    # 优化键 - 调整渲染频率
+                    elif event.key == pygame.K_F1:
+                        render_every_n_frames = 1  # 每帧渲染
+                    elif event.key == pygame.K_F2:
+                        render_every_n_frames = 2  # 每2帧渲染
+                    elif event.key == pygame.K_F3:
+                        render_every_n_frames = 3  # 每3帧渲染
+        else:
+            # 无GUI模式下简单处理中断信号
+            try:
+                # 每100帧输出一次状态信息
+                if universe.frame_count % 100 == 0:
+                    total_biomass = sum(agent.energy for agent in universe.agents)
+                    print(f"帧: {universe.frame_count} | 生命体: {len(universe.agents)}/{MAX_AGENTS} | 总生物量: {int(total_biomass)}")
+            except KeyboardInterrupt:
+                print("收到中断信号，正在退出...")
                 running = False
-            
-            # 窗口大小调整
-            if event.type == pygame.VIDEORESIZE:
-                current_screen_width, current_screen_height = event.size
-            
-            # 相机事件处理
-            universe.camera.handle_event(event, mouse_pos)
-            
-            # 鼠标点击
-            if event.type == pygame.MOUSEBUTTONDOWN:
-                if event.button == 1 and mouse_pos[0] < universe.camera.render_width:
-                    universe.handle_click(event.pos)
-                    
-            # 键盘控制
-            if event.type == pygame.KEYDOWN:
-                # 空格暂停/继续
-                if event.key == pygame.K_SPACE: 
-                    paused = not paused
-                    
-                # 右箭头在暂停时单步执行
-                if event.key == pygame.K_RIGHT and paused: 
-                    universe.update(0.016)
-                    
-                # F11全屏切换
-                if event.key == pygame.K_F11:
-                    pygame.display.toggle_fullscreen()
-                    
-                # 数字键切换视图模式
-                if event.key == pygame.K_0:
-                    universe.view_mode = 0
-                elif event.key == pygame.K_1:
-                    universe.view_mode = 1
-                elif event.key == pygame.K_2:
-                    universe.view_mode = 2
-                elif event.key == pygame.K_3:
-                    universe.view_mode = 3
-                elif event.key == pygame.K_4:
-                    universe.view_mode = 4
-                    
-                # 优化键 - 调整渲染频率
-                elif event.key == pygame.K_F1:
-                    render_every_n_frames = 1  # 每帧渲染
-                elif event.key == pygame.K_F2:
-                    render_every_n_frames = 2  # 每2帧渲染
-                elif event.key == pygame.K_F3:
-                    render_every_n_frames = 3  # 每3帧渲染
         
         # 非暂停状态下更新模拟
         if not paused:
@@ -2184,8 +2232,8 @@ def main():
             fixed_dt = 0.016  # 约60FPS
             universe.update(fixed_dt)
         
-        # 只在需要渲染的帧上执行渲染
-        if render_this_frame:
+        # 只在需要渲染的帧上执行渲染，且仅在GUI模式下
+        if use_gui and render_this_frame:
             # 清除屏幕
             screen.fill((0,0,0))
             
@@ -2237,13 +2285,17 @@ def main():
             
             if universe.perf_monitor:
                 universe.perf_monitor.end_frame(len(universe.agents))
-        
-        # 不限制帧率，让CPU全速运行
-        # clock.tick(60)
+            
+            # GUI模式下控制帧率
+            # clock.tick(60)  # 不限制帧率
     
     # 确保退出前刷新日志缓冲区
     logger._flush_buffers()
-    pygame.quit()
+    
+    # 如果使用了pygame，则退出
+    if use_gui:
+        pygame.quit()
+    print("模拟结束")
 
 if __name__ == '__main__':
     main() 
