@@ -26,6 +26,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from pygame.math import Vector2
+import base64
 
 # --- 第一部分: 宇宙公理 (Axioms of the Universe) ---
 
@@ -104,15 +105,34 @@ class DataLogger:
         with open(self.event_log_path, 'w', newline='', encoding='utf-8') as f:
             csv.writer(f).writerow(self.event_header)
             
+        # 添加场景数据日志文件
+        self.field_log_path = os.path.join(self.log_dir, "field_log.csv")
+        self.field_header = ["frame", "field_type", "data"]
+        with open(self.field_log_path, 'w', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow(self.field_header)
+            
+        # 添加信号类型日志文件
+        self.signal_types_path = os.path.join(self.log_dir, "signal_types.json")
+        
         self.agent_id_counter = 0
         
         # 缓冲区，减少I/O操作
         self.state_buffer = []
         self.event_buffer = []
+        self.field_buffer = []  # 新增场数据缓冲区
         self.buffer_size_limit = LOG_BUFFER_SIZE  # 使用全局配置
         self.last_flush_time = time.time()
         self.flush_interval = LOG_FLUSH_INTERVAL  # 使用全局配置
-
+        
+    # 添加记录信号类型的方法
+    def log_signal_types(self, signal_types):
+        """记录模拟中出现的信号类型"""
+        try:
+            with open(self.signal_types_path, 'w', encoding='utf-8') as f:
+                json.dump(list(signal_types), f)
+        except Exception as e:
+            print(f"记录信号类型错误: {str(e)}")
+    
     def get_new_agent_id(self):
         self.agent_id_counter += 1
         return self.agent_id_counter
@@ -137,10 +157,23 @@ class DataLogger:
         # 检查是否需要刷新缓冲区
         self._check_flush_buffer()
     
+    def log_field(self, frame, fields):
+        # 记录场数据
+        for idx, field in enumerate(fields):
+            # 将numpy数组转换为压缩的base64字符串
+            field_data = np.array(field.grid, dtype=np.float32)
+            field_bytes = field_data.tobytes()
+            encoded_data = base64.b64encode(field_bytes).decode('ascii')
+            
+            self.field_buffer.append([frame, field.name, encoded_data])
+        
+        # 检查是否需要刷新缓冲区
+        self._check_flush_buffer()
+    
     def _check_flush_buffer(self):
         # 如果缓冲区达到大小限制或者距离上次刷新已经过了指定时间，则刷新缓冲区
         current_time = time.time()
-        if (len(self.state_buffer) + len(self.event_buffer) > self.buffer_size_limit or
+        if (len(self.state_buffer) + len(self.event_buffer) + len(self.field_buffer) > self.buffer_size_limit or
             current_time - self.last_flush_time > self.flush_interval):
             self._flush_buffers()
     
@@ -160,6 +193,13 @@ class DataLogger:
                     writer = csv.writer(f)
                     writer.writerows(self.event_buffer)
                 self.event_buffer = []
+                
+            # 刷新场数据缓冲区
+            if self.field_buffer:
+                with open(self.field_log_path, 'a', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerows(self.field_buffer)
+                self.field_buffer = []
             
             # 更新最后刷新时间
             self.last_flush_time = time.time()
@@ -597,9 +637,14 @@ class Agent:
             elif node_type == 'signal' and i < 4:  # 限制最多作用于前4个信号场
                 # 信号节点控制信号释放
                 field_idx = i % len(self.universe.fields)
-                if abs(activation) > SIGNAL_RENDER_THRESHOLD:
-                    self.universe.fields[field_idx].add_circular_source(
+                # 确保信号只影响信号场(索引≥2)，不影响能量场(索引0)和危险场(索引1)
+                signal_field_idx = field_idx + 2
+                if signal_field_idx < len(self.universe.fields) and abs(activation) > SIGNAL_RENDER_THRESHOLD:
+                    self.universe.fields[signal_field_idx].add_circular_source(
                         self.position, SIGNAL_EMISSION_RADIUS, abs(activation) * 0.01)
+                    # 记录信号类型
+                    signal_name = f"Signal {signal_field_idx}"
+                    self.universe.signal_types.add(signal_name)
             elif node_type == 'energy':
                 # 能量调控节点 - 可以调整能量吸收效率
                 self.env_absorption_coeff = activation * 0.1 + self.gene.get('env_absorption_coeff', 0.5)
@@ -958,8 +1003,18 @@ class Agent:
         if child_pos is None:
             return None
 
+        # 增加繁殖的额外能量消耗
+        # 基础繁殖成本
+        reproduction_cost = self.e_child
+        # 额外繁殖开销 - 比例为总繁殖能量的20%
+        extra_cost = self.e_child * 0.2
+        total_cost = reproduction_cost + extra_cost
+        
         # 消耗能量创建后代
-        self.energy -= self.e_child
+        self.energy -= total_cost
+        
+        # 将能量分配给子代 - 只分配基础繁殖成本
+        child_energy = reproduction_cost
         
         # 复制基因并可能发生突变
         new_gene = json.loads(json.dumps(self.gene))
@@ -1172,21 +1227,19 @@ class Agent:
                 mutations_occurred.append('node_type_mutation')
 
         # 检查是否发生了突变
-        is_mutant_child = len(mutations_occurred) > 0
+        is_mutant = len(mutations_occurred) > 0
         
         # 创建子代（使用找到的无重叠位置）
         child = Agent(self.universe, self.logger, gene=new_gene, position=child_pos, 
-                     energy=self.e_child, parent_id=self.id, is_mutant=is_mutant_child)
+                     energy=child_energy, parent_id=self.id, is_mutant=is_mutant)
         
-        # 记录突变事件
-        if is_mutant_child:
+        # 将繁殖和突变事件记录到日志
+        if is_mutant:
             self.logger.log_event(
-                self.universe.frame_count, 
-                'MUTATION', 
-                {'parent_id': self.id, 'parent_genotype': self.genotype_id, 
-                 'child_id': child.id, 'child_genotype': child.genotype_id, 
-                 'types': list(set(mutations_occurred))}
+                self.universe.frame_count, 'MUTATION', 
+                {'parent_id': self.id, 'child_id': child.id, 'mutations': mutations_occurred}
             )
+        
         return child
 
     def draw(self, surface, camera):
@@ -1270,6 +1323,9 @@ class Universe:
             Field(WORLD_SIZE, 0, "Biotic 2"),        # 生物信号场2（红色）
         ]
         self.nutrient_field, self.hazard_field, self.biotic_field_1, self.biotic_field_2 = self.fields
+        
+        # 跟踪出现的信号类型
+        self.signal_types = set()
         
         # 初始化宇宙状态
         self.frame_count = 0
@@ -1603,6 +1659,10 @@ class Universe:
         # 定期记录状态
         if self.frame_count % 20 == 0:
             self.logger.log_state(self.frame_count, self.agents)
+            # 同时记录场景数据
+            self.logger.log_field(self.frame_count, self.fields)
+            # 记录信号类型
+            self.logger.log_signal_types(self.signal_types)
             
         if self.perf_monitor:
             self.perf_monitor.end_update()
@@ -1892,13 +1952,18 @@ def draw_neural_network(surface, font, agent, x, y, width, height, mouse_pos):
     
     # 为所有节点类型创建标签
     input_labels = []
-    # 环境感知标签
     basic_input_labels = ["N_v", "N_gx", "N_gy", "H_v", "H_gx", "H_gy", "B1_v", "B1_gx", "B1_gy", "B2_v", "B2_gx", "B2_gy"]
+    signal_in_count = 0
     for i in range(n_in):
-        if i < len(basic_input_labels):
+        node_type = None
+        if 'node_types' in agent.gene and 'input' in agent.gene['node_types'] and i < len(agent.gene['node_types']['input']):
+            node_type = agent.gene['node_types']['input'][i]
+        if node_type == 'signal_sense':
+            input_labels.append(f"SigIn_{signal_in_count+1}")
+            signal_in_count += 1
+        elif i < len(basic_input_labels):
             input_labels.append(basic_input_labels[i])
         else:
-            # 额外输入节点
             input_labels.append(f"In_{i}")
     
     # 输出标签
