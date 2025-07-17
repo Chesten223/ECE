@@ -90,32 +90,52 @@ SIGNAL_RENDER_THRESHOLD = 0.2  # 信号渲染阈值
 
 # --- 数据日志系统 ---
 class DataLogger:
-    def __init__(self):
+    def __init__(self, continue_from=None):
+        # 创建新的日志目录
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         self.log_dir = os.path.join("logs", f"run_{timestamp}")
         os.makedirs(self.log_dir, exist_ok=True)
         
+        if continue_from:
+            # 从指定的日志目录继续模拟，但写入新目录
+            self.continue_from_existing = True
+            self.source_log_dir = continue_from
+            
+            # 读取现有日志文件以获取最后一帧和智能体ID计数器
+            self.agent_id_counter = self._get_max_agent_id(continue_from)
+            self.last_frame = self._get_last_frame(continue_from)
+            
+            # 复制旧日志文件到新目录
+            self._copy_log_files(continue_from)
+            
+            print(f"继续从日志 {continue_from} 的第 {self.last_frame} 帧开始模拟，新日志保存在 {self.log_dir}")
+        else:
+            # 全新的模拟
+            self.continue_from_existing = False
+            self.agent_id_counter = 0
+            self.last_frame = 0
+        
+        # 初始化日志文件路径
         self.state_log_path = os.path.join(self.log_dir, "simulation_log.csv")
-        self.state_header = ["frame", "agent_id", "parent_id", "genotype_id", "is_mutant", "energy", 
-                            "pos_x", "pos_y", "n_hidden", "n_connections", "computation_depth", "gene_string"]
-        with open(self.state_log_path, 'w', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow(self.state_header)
-
         self.event_log_path = os.path.join(self.log_dir, "event_log.csv")
-        self.event_header = ["frame", "event_type", "details"]
-        with open(self.event_log_path, 'w', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow(self.event_header)
-            
-        # 添加场景数据日志文件
         self.field_log_path = os.path.join(self.log_dir, "field_log.csv")
-        self.field_header = ["frame", "field_type", "data"]
-        with open(self.field_log_path, 'w', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow(self.field_header)
-            
-        # 添加信号类型日志文件
         self.signal_types_path = os.path.join(self.log_dir, "signal_types.json")
         
-        self.agent_id_counter = 0
+        # 如果是全新模拟，创建新文件并写入表头
+        if not self.continue_from_existing:
+            self.state_header = ["frame", "agent_id", "parent_id", "genotype_id", "is_mutant", "energy", 
+                                "pos_x", "pos_y", "n_hidden", "n_connections", "computation_depth", "gene_string"]
+            with open(self.state_log_path, 'w', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerow(self.state_header)
+
+            self.event_header = ["frame", "event_type", "details"]
+            with open(self.event_log_path, 'w', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerow(self.event_header)
+                
+            # 添加场景数据日志文件
+            self.field_header = ["frame", "field_type", "data"]
+            with open(self.field_log_path, 'w', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerow(self.field_header)
         
         # 缓冲区，减少I/O操作
         self.state_buffer = []
@@ -124,8 +144,103 @@ class DataLogger:
         self.buffer_size_limit = LOG_BUFFER_SIZE  # 使用全局配置
         self.last_flush_time = time.time()
         self.flush_interval = LOG_FLUSH_INTERVAL  # 使用全局配置
-        
-    # 添加记录信号类型的方法
+    
+    def _copy_log_files(self, source_dir):
+        """复制旧日志文件到新目录"""
+        try:
+            # 复制状态日志
+            source_state_log = os.path.join(source_dir, "simulation_log.csv")
+            if os.path.exists(source_state_log):
+                with open(source_state_log, 'r', newline='', encoding='utf-8') as src, \
+                     open(self.state_log_path, 'w', newline='', encoding='utf-8') as dst:
+                    dst.write(src.read())
+            
+            # 复制事件日志
+            source_event_log = os.path.join(source_dir, "event_log.csv")
+            if os.path.exists(source_event_log):
+                with open(source_event_log, 'r', newline='', encoding='utf-8') as src, \
+                     open(self.event_log_path, 'w', newline='', encoding='utf-8') as dst:
+                    dst.write(src.read())
+            
+            # 复制场数据日志
+            source_field_log = os.path.join(source_dir, "field_log.csv")
+            if os.path.exists(source_field_log):
+                with open(source_field_log, 'r', newline='', encoding='utf-8') as src, \
+                     open(self.field_log_path, 'w', newline='', encoding='utf-8') as dst:
+                    dst.write(src.read())
+            
+            # 复制信号类型日志
+            source_signal_types = os.path.join(source_dir, "signal_types.json")
+            if os.path.exists(source_signal_types):
+                with open(source_signal_types, 'r', encoding='utf-8') as src, \
+                     open(self.signal_types_path, 'w', encoding='utf-8') as dst:
+                    dst.write(src.read())
+            
+            print(f"已复制日志文件从 {source_dir} 到 {self.log_dir}")
+        except Exception as e:
+            print(f"复制日志文件时出错: {str(e)}")
+    
+    def _get_max_agent_id(self, log_dir=None):
+        """从现有日志中获取最大的智能体ID"""
+        max_id = 0
+        try:
+            path = os.path.join(log_dir or self.log_dir, "simulation_log.csv")
+            with open(path, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                next(reader)  # 跳过表头
+                for row in reader:
+                    if len(row) > 1:
+                        agent_id = int(row[1])
+                        max_id = max(max_id, agent_id)
+        except Exception as e:
+            print(f"读取智能体ID时出错: {str(e)}")
+        return max_id
+    
+    def _get_last_frame(self, log_dir=None):
+        """从现有日志中获取最后一帧的帧号"""
+        last_frame = 0
+        try:
+            path = os.path.join(log_dir or self.log_dir, "simulation_log.csv")
+            with open(path, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                next(reader)  # 跳过表头
+                for row in reader:
+                    if len(row) > 0:
+                        frame = int(row[0])
+                        last_frame = max(last_frame, frame)
+        except Exception as e:
+            print(f"读取最后一帧时出错: {str(e)}")
+        return last_frame
+    
+    def load_last_state(self):
+        """加载最后一帧的状态，用于恢复模拟"""
+        agents_data = []
+        try:
+            # 如果是继续模拟，从源日志目录读取
+            path = os.path.join(self.source_log_dir if hasattr(self, 'source_log_dir') else self.log_dir, "simulation_log.csv")
+            with open(path, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                next(reader)  # 跳过表头
+                for row in reader:
+                    if len(row) > 0 and int(row[0]) == self.last_frame:
+                        agents_data.append(row)
+        except Exception as e:
+            print(f"加载最后状态时出错: {str(e)}")
+        return agents_data
+    
+    def load_signal_types(self):
+        """加载信号类型"""
+        signal_types = set()
+        try:
+            # 如果是继续模拟，从源日志目录读取
+            path = os.path.join(self.source_log_dir if hasattr(self, 'source_log_dir') else self.log_dir, "signal_types.json")
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    signal_types = set(json.load(f))
+        except Exception as e:
+            print(f"加载信号类型时出错: {str(e)}")
+        return signal_types
+    
     def log_signal_types(self, signal_types):
         """记录模拟中出现的信号类型"""
         try:
@@ -957,9 +1072,9 @@ class Agent:
         neighbors = self.universe.get_neighbors(self)
         
         # 尝试找到一个没有重叠的位置
-        max_attempts = 20
+        max_attempts = 30  # 增加尝试次数，从20增加到30
         child_pos = None
-        min_safe_distance = self.radius * 3.0
+        min_safe_distance = self.radius * 2.5  # 降低安全距离要求，从3.0降低到2.5
         
         # 缓存邻居位置 - 只检查邻近区域而不是全部智能体
         neighbor_positions = []
@@ -967,10 +1082,12 @@ class Agent:
             if agent is not self and not agent.is_dead:
                 neighbor_positions.append(agent.position)
         
-        for _ in range(max_attempts):
+        for attempt in range(max_attempts):
             # 生成一个候选位置
             angle = random.uniform(0, 2 * math.pi)
-            distance = random.uniform(self.radius * 3.0, self.radius * 8.0)
+            # 随着尝试次数增加，逐渐扩大搜索范围
+            distance_factor = 1.0 + attempt * 0.1
+            distance = random.uniform(self.radius * 2.0, self.radius * 10.0 * distance_factor)
             candidate_pos = Vector2(
                 self.position.x + math.cos(angle) * distance,
                 self.position.y + math.sin(angle) * distance
@@ -996,8 +1113,12 @@ class Agent:
                 child_pos = candidate_pos
                 break
         
-        # 如果找不到合适的位置，则不繁殖
+        # 如果找不到合适的位置，则不繁殖，但记录这个事件
         if child_pos is None:
+            # 记录繁殖失败事件
+            self.logger.log_event(self.universe.frame_count, 'REPRODUCTION_FAILED', 
+                                 {'agent_id': self.id, 'reason': 'no_valid_position', 
+                                  'neighbors': len(neighbor_positions)})
             return None
 
         # 增加繁殖的额外能量消耗
@@ -1317,9 +1438,10 @@ class Agent:
 
 # --- 宇宙系统 ---
 class Universe:
-    def __init__(self, logger, render_width, render_height, use_gui=True):
+    def __init__(self, logger, render_width, render_height, use_gui=True, continue_simulation=False):
         self.logger = logger
         self.use_gui = use_gui
+        self.continue_simulation = continue_simulation
         
         # 初始化信息场
         self.fields = [
@@ -1334,7 +1456,7 @@ class Universe:
         self.signal_types = set()
         
         # 初始化宇宙状态
-        self.frame_count = 0
+        self.frame_count = 0 if not continue_simulation else logger.last_frame
         self.selected_agent = None
         self.view_mode = 1  # 默认显示营养场
         
@@ -1358,47 +1480,15 @@ class Universe:
         # 封闭能量系统：在模拟开始时一次性投放能量
         self._initial_energy_seeding()
         
-        # 创建初始智能体 - 确保位置不重叠
+        # 创建初始智能体
         self.agents = []
-        occupied_positions = []
         
-        # 创建指定数量的初始智能体
-        for _ in range(INITIAL_AGENT_COUNT):
-            valid_position = False
-            max_attempts = 50  # 每个智能体尝试位置的最大次数
-            
-            for _ in range(max_attempts):
-                # 生成随机位置
-                candidate_pos = Vector2(
-                    random.uniform(0, WORLD_SIZE),
-                    random.uniform(0, WORLD_SIZE)
-                )
-                
-                # 检查是否与现有智能体重叠
-                valid_position = True
-                
-                for existing_pos in occupied_positions:
-                    # 考虑周期性边界条件计算距离
-                    dx = min(abs(candidate_pos.x - existing_pos.x), WORLD_SIZE - abs(candidate_pos.x - existing_pos.x))
-                    dy = min(abs(candidate_pos.y - existing_pos.y), WORLD_SIZE - abs(candidate_pos.y - existing_pos.y))
-                    dist_sq = dx * dx + dy * dy
-                    
-                    if dist_sq < AGENT_RADIUS * 3.0 * AGENT_RADIUS * 3.0:
-                        valid_position = False
-                        break
-                
-                # 如果找到有效位置，创建智能体
-                if valid_position:
-                    # 创建新智能体并添加到列表
-                    agent = Agent(self, self.logger, position=candidate_pos)
-                    self.agents.append(agent)
-                    occupied_positions.append(candidate_pos)
-                    break
-            
-            # 如果无法找到有效位置，记录警告
-            if not valid_position:
-                self.logger.log_event(0, 'SPAWN_WARNING', 
-                                    {'message': f'无法为智能体 #{_+1} 找到合适位置'})
+        if continue_simulation:
+            # 从日志加载智能体
+            self._load_agents_from_log()
+        else:
+            # 创建新的智能体
+            self._create_initial_agents()
         
         # 记录实际创建的智能体数量
         actual_count = len(self.agents)
@@ -1826,6 +1916,102 @@ class Universe:
                 
         self.selected_agent = closest_agent
 
+    def _load_agents_from_log(self):
+        """从日志加载智能体状态"""
+        agents_data = self.logger.load_last_state()
+        signal_types = self.logger.load_signal_types()
+        self.signal_types = signal_types
+        
+        print(f"从日志加载 {len(agents_data)} 个智能体")
+        
+        for agent_row in agents_data:
+            try:
+                # 解析智能体数据
+                agent_id = int(agent_row[1])
+                parent_id = int(agent_row[2]) if agent_row[2] != "None" else None
+                genotype_id = int(agent_row[3])
+                is_mutant = agent_row[4].lower() == "true"
+                energy = float(agent_row[5])
+                pos_x = float(agent_row[6])
+                pos_y = float(agent_row[7])
+                gene_str = agent_row[11]
+                
+                # 解析基因
+                gene = json.loads(gene_str.replace("'", "\""))
+                
+                # 创建智能体
+                agent = Agent(
+                    universe=self,
+                    logger=self.logger,
+                    gene=gene,
+                    position=Vector2(pos_x, pos_y),
+                    energy=energy,
+                    parent_id=parent_id,
+                    is_mutant=is_mutant
+                )
+                
+                # 设置智能体ID和基因型ID
+                agent.id = agent_id
+                agent.genotype_id = genotype_id
+                
+                # 注册基因型
+                canonical_gene = self._get_canonical_gene(gene)
+                self.genotype_registry[canonical_gene] = genotype_id
+                self.next_genotype_id = max(self.next_genotype_id, genotype_id + 1)
+                
+                # 添加到智能体列表
+                self.agents.append(agent)
+            except Exception as e:
+                print(f"加载智能体时出错: {str(e)}")
+    
+    def _create_initial_agents(self):
+        """创建初始智能体 - 确保位置不重叠"""
+        occupied_positions = []
+        
+        # 创建指定数量的初始智能体
+        for _ in range(INITIAL_AGENT_COUNT):
+            valid_position = False
+            max_attempts = 50  # 每个智能体尝试位置的最大次数
+            
+            for _ in range(max_attempts):
+                # 生成随机位置
+                candidate_pos = Vector2(
+                    random.uniform(0, WORLD_SIZE),
+                    random.uniform(0, WORLD_SIZE)
+                )
+                
+                # 检查是否与现有智能体重叠
+                valid_position = True
+                
+                for existing_pos in occupied_positions:
+                    # 考虑周期性边界条件计算距离
+                    dx = min(abs(candidate_pos.x - existing_pos.x), WORLD_SIZE - abs(candidate_pos.x - existing_pos.x))
+                    dy = min(abs(candidate_pos.y - existing_pos.y), WORLD_SIZE - abs(candidate_pos.y - existing_pos.y))
+                    dist_sq = dx * dx + dy * dy
+                    
+                    if dist_sq < AGENT_RADIUS * 3.0 * AGENT_RADIUS * 3.0:
+                        valid_position = False
+                        break
+                
+                # 如果找到有效位置，创建智能体
+                if valid_position:
+                    # 创建新智能体并添加到列表
+                    agent = Agent(self, self.logger, position=candidate_pos)
+                    self.agents.append(agent)
+                    occupied_positions.append(candidate_pos)
+                    break
+            
+            # 如果无法找到有效位置，记录警告
+            if not valid_position:
+                self.logger.log_event(0, 'SPAWN_WARNING', 
+                                    {'message': f'无法为智能体 #{_+1} 找到合适位置'})
+        
+        # 记录实际创建的智能体数量
+        actual_count = len(self.agents)
+        if actual_count < INITIAL_AGENT_COUNT:
+            self.logger.log_event(0, 'SPAWN_WARNING', 
+                                {'message': f'Only created {actual_count}/{INITIAL_AGENT_COUNT} agents due to space constraints'})
+
 # --- UI组件 ---
 def draw_inspector_panel(surface, font, agent, mouse_pos, panel_x, panel_width, panel_height):
     """绘制智能体观察面板"""
@@ -2150,10 +2336,19 @@ def main():
     # 解析命令行参数
     parser = argparse.ArgumentParser(description="涌现认知生态系统 (ECE) v5.0")
     parser.add_argument("--no-gui", action="store_true", help="无GUI模式，仅运行计算")
+    parser.add_argument("--continue-from", type=str, help="从指定的日志目录继续模拟，新日志将保存在新的日志目录中")
     args = parser.parse_args()
     
     # 使用GUI模式
     use_gui = not args.no_gui
+    
+    # 初始化数据记录器
+    if args.continue_from:
+        logger = DataLogger(args.continue_from)
+        continue_simulation = True
+    else:
+        logger = DataLogger()
+        continue_simulation = False
     
     # 如果使用GUI模式，初始化pygame
     if use_gui:
@@ -2191,14 +2386,14 @@ def main():
         sim_area_width = INITIAL_SCREEN_WIDTH - INFO_PANEL_WIDTH
         current_screen_height = INITIAL_SCREEN_HEIGHT
     
-    # 初始化数据记录器
-    logger = DataLogger()
-    
     # 创建宇宙
-    universe = Universe(logger, sim_area_width, current_screen_height, use_gui)
+    universe = Universe(logger, sim_area_width, current_screen_height, use_gui, continue_simulation)
     
     # 记录模拟开始事件
-    logger.log_event(0, 'SIM_START', {'initial_agents': INITIAL_AGENT_COUNT, 'world_size': WORLD_SIZE, 'gui_mode': use_gui})
+    if not continue_simulation:
+        logger.log_event(0, 'SIM_START', {'initial_agents': INITIAL_AGENT_COUNT, 'world_size': WORLD_SIZE, 'gui_mode': use_gui})
+    else:
+        logger.log_event(universe.frame_count, 'SIM_CONTINUE', {'agents': len(universe.agents), 'from_frame': universe.frame_count})
     
     # 控制变量
     running = True
