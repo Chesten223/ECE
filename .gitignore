@@ -1,2 +1,18 @@
 *.csv
 *.json
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+.venv/
+
+# Logs
+logs/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
