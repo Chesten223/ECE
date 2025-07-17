@@ -67,6 +67,7 @@ REPULSION_PRIORITY = 2.0       # 排斥力优先级，确保排斥力优先于�
 ENERGY_PATCH_RADIUS_MIN = 60.0 # 能量辐射最小范围 (原来是30)
 ENERGY_PATCH_RADIUS_MAX = 120.0 # 能量辐射最大范围 (原来是60)
 ENERGY_GRADIENT_FACTOR = 0.6   # 能量梯度因子，越小梯度越缓
+SPAWN_SAFE_DISTANCE = AGENT_RADIUS * 3.0  # 生成新智能体时的安全距离
 
 # 4. 性能优化参数
 MAX_THREADS = max(4, multiprocessing.cpu_count() - 1)  # 使用CPU核心数-1的线程数
@@ -479,15 +480,15 @@ class Agent:
         # 极简的节点类型初始化
         input_types = []
         for _ in range(n_input):
-            input_types.append(random.choice(['general', 'field_sense', 'signal_sense', 'special']))
+            input_types.append(random.choice(['field_sense', 'signal_sense']))
             
         output_types = []
         for _ in range(n_output):
-            output_types.append(random.choice(['movement', 'signal', 'energy', 'special']))
+            output_types.append(random.choice(['movement', 'signal']))
             
         hidden_types = []
         for _ in range(n_hidden):
-            hidden_types.append(random.choice(['standard', 'memory', 'processing', 'special']))
+            hidden_types.append('standard')
         
         # 返回极简的基因结构
         return {
@@ -564,7 +565,7 @@ class Agent:
         perception_vector = self.universe.get_perception_vector(self.position)
         
         # 根据节点类型决定如何处理输入 - 使用向量化操作
-        node_types = ['general'] * self.n_input  # 默认类型
+        node_types = ['field_sense'] * self.n_input  # 默认类型改为field_sense
         if 'node_types' in self.gene and 'input' in self.gene['node_types']:
             # 获取节点类型，确保长度匹配
             types_list = self.gene['node_types']['input']
@@ -574,23 +575,14 @@ class Agent:
         # 批量更新输入节点 - 使用NumPy向量化操作
         # 创建掩码数组以进行批量更新
         field_sense_mask = np.array([t == 'field_sense' for t in node_types[:len(perception_vector)]], dtype=bool)
-        general_mask = np.array([t == 'general' for t in node_types[:len(perception_vector)]], dtype=bool)
+        signal_sense_mask = np.array([t == 'signal_sense' for t in node_types[:len(perception_vector)]], dtype=bool)
         
-        # 批量更新field_sense和general类型节点
+        # 批量更新不同类型节点
         if np.any(field_sense_mask) and len(field_sense_mask) == len(perception_vector):
             self.node_activations[:len(perception_vector)][field_sense_mask] = perception_vector[field_sense_mask]
         
-        if np.any(general_mask) and len(general_mask) == len(perception_vector):
-            self.node_activations[:len(perception_vector)][general_mask] = perception_vector[general_mask]
-        
-        # 单独处理特殊类型节点（需要随机性）
-        for i in range(min(self.n_input, len(perception_vector))):
-            node_type = node_types[i]
-            if node_type == 'signal_sense':
-                if random.random() > 0.7:  # 70%概率更新
-                    self.node_activations[i] = perception_vector[i]
-            elif node_type == 'special':
-                self.node_activations[i] = self.node_activations[i] * 0.9 + random.uniform(-0.1, 0.1)
+        if np.any(signal_sense_mask) and len(signal_sense_mask) == len(perception_vector):
+            self.node_activations[:len(perception_vector)][signal_sense_mask] = perception_vector[signal_sense_mask]
         
         # 执行计算步骤（由基因决定的深度）- 使用矩阵运算提高效率
         # 预分配内存以减少重复分配
@@ -623,7 +615,7 @@ class Agent:
         for i, activation in enumerate(output_activations):
             # 获取当前输出节点类型
             node_type = 'movement'  # 默认为移动类型
-            if 'node_types' in self.gene and i < len(self.gene['node_types']['output']):
+            if 'node_types' in self.gene and 'output' in self.gene['node_types'] and i < len(self.gene['node_types']['output']):
                 node_type = self.gene['node_types']['output'][i]
             
             # 根据节点类型执行不同行为
@@ -634,21 +626,26 @@ class Agent:
                     move_vector.x += activation
                 elif i % 2 == 1:  # Y方向
                     move_vector.y += activation
-            elif node_type == 'signal' and i < 4:  # 限制最多作用于前4个信号场
-                # 信号节点控制信号释放
-                field_idx = i % len(self.universe.fields)
-                # 确保信号只影响信号场(索引≥2)，不影响能量场(索引0)和危险场(索引1)
-                signal_field_idx = field_idx + 2
-                if signal_field_idx < len(self.universe.fields) and abs(activation) > SIGNAL_RENDER_THRESHOLD:
-                    self.universe.fields[signal_field_idx].add_circular_source(
-                        self.position, SIGNAL_EMISSION_RADIUS, abs(activation) * 0.01)
+            elif node_type == 'signal':
+                # 信号节点控制信号释放 - 允许更多信号类型
+                # 计算信号场索引 - 允许多达8种不同信号
+                signal_count = len(self.universe.fields) - 2  # 减去能量场和危险场
+                field_idx = (i % signal_count) + 2  # 从索引2开始(跳过能量场和危险场)
+                
+                if field_idx < len(self.universe.fields) and abs(activation) > SIGNAL_RENDER_THRESHOLD:
+                    # 信号强度与激活值成正比
+                    signal_strength = abs(activation) * 0.02
+                    
+                    # 信号半径与激活值成正比
+                    signal_radius = SIGNAL_EMISSION_RADIUS * (0.5 + abs(activation) * 0.5)
+                    
+                    # 发射信号
+                    self.universe.fields[field_idx].add_circular_source(
+                        self.position, signal_radius, signal_strength)
+                    
                     # 记录信号类型
-                    signal_name = f"Signal {signal_field_idx}"
+                    signal_name = f"Signal {field_idx-1}"  # 信号编号从1开始
                     self.universe.signal_types.add(signal_name)
-            elif node_type == 'energy':
-                # 能量调控节点 - 可以调整能量吸收效率
-                self.env_absorption_coeff = activation * 0.1 + self.gene.get('env_absorption_coeff', 0.5)
-            # 'special'节点不执行明确动作，但其值会传递给其他节点
         
         # 确保所有生物都有最小移动量
         if move_vector.length_squared() < MIN_MOVEMENT_JITTER**2:
@@ -662,7 +659,7 @@ class Agent:
         if COLLISION_OPTIMIZATION:
             self._optimized_collision_detection(neighbors, dt)
         else:
-            self._standard_collision_detection(neighbors, dt)
+            self._standard_collision_detection(neighbors, dt, move_vector)
             
         # 确保在世界边界内
         self.position.x = max(0, min(WORLD_SIZE, self.position.x))
@@ -824,8 +821,8 @@ class Agent:
                     # 将当前智能体沿碰撞向量推开整个重叠距离
                     push_vector = data['dist_vec'].normalize() * overlap
                     self.position += push_vector
-    
-    def _standard_collision_detection(self, neighbors, dt):
+
+    def _standard_collision_detection(self, neighbors, dt, move_vector):
         """标准的碰撞检测算法（原始版本）"""
         # 3. 添加温和排斥力
         repulsion_vector = Vector2(0, 0)
@@ -1029,15 +1026,18 @@ class Agent:
                 
         # 添加连接
         if random.random() < MUTATION_PROBABILITY['add_conn']:
-            from_n = random.randint(0, new_gene['n_input'] + new_gene['n_hidden'] - 1)
-            to_n = random.randint(new_gene['n_input'], new_gene['n_input'] + new_gene['n_hidden'] + new_gene['n_output'] - 1)
-            if to_n > from_n:  # 避免回路
-                new_gene['connections'].append([from_n, to_n, random.uniform(-1, 1)])
-                mutations_occurred.append('add_connection')
+            # 确保有足够的节点可以添加连接
+            total_nodes = new_gene['n_input'] + new_gene['n_hidden'] + new_gene['n_output']
+            if new_gene['n_input'] > 0 and total_nodes > new_gene['n_input']:  # 确保有源节点和目标节点
+                from_n = random.randint(0, new_gene['n_input'] + new_gene['n_hidden'] - 1)
+                to_n = random.randint(new_gene['n_input'], total_nodes - 1)
+                if to_n > from_n:  # 避免回路
+                    new_gene['connections'].append([from_n, to_n, random.uniform(-1, 1)])
+                    mutations_occurred.append('add_connection')
             
         # 删除连接
-        if len(new_gene['connections']) > 2 and random.random() < MUTATION_PROBABILITY['del_conn']:
-            # 保留至少2个连接，确保基本功能
+        if random.random() < MUTATION_PROBABILITY['del_conn'] and len(new_gene['connections']) > 0:
+            # 只有在有连接可删除时才删除
             new_gene['connections'].pop(random.randrange(len(new_gene['connections'])))
             mutations_occurred.append('delete_connection')
             
@@ -1058,27 +1058,28 @@ class Agent:
         
         # 1. 添加输入节点突变
         if random.random() < MUTATION_PROBABILITY['add_node'] * 0.5:
-            # 完全随机添加输入节点
-            if new_gene['n_input'] < 20:  # 限制最大数量
-                new_gene['n_input'] += 1
-                
-                # 更新节点类型记录
-                if 'node_types' in new_gene:
-                    # 随机选择新节点类型
-                    new_type = random.choice(['general', 'field_sense', 'signal_sense', 'special'])
-                    new_gene['node_types']['input'].append(new_type)
-                
-                # 为新节点创建随机连接
+            # 完全随机添加输入节点，不限制最大数量
+            new_gene['n_input'] += 1
+            
+            # 更新节点类型记录
+            if 'node_types' in new_gene:
+                # 随机选择新节点类型
+                new_type = random.choice(['field_sense', 'signal_sense'])
+                new_gene['node_types']['input'].append(new_type)
+            
+            # 为新节点创建随机连接
+            total_nodes = new_gene['n_input'] + new_gene['n_hidden'] + new_gene['n_output']
+            if total_nodes > new_gene['n_input']:  # 确保有目标节点可连接
                 for _ in range(random.randint(1, 3)):
                     to_node = random.randint(new_gene['n_input'], 
-                                             new_gene['n_input'] + new_gene['n_hidden'] + new_gene['n_output'] - 1)
+                                            total_nodes - 1)
                     new_gene['connections'].append([new_gene['n_input'] - 1, to_node, random.uniform(-2, 2)])
-                
-                mutations_occurred.append('add_input_node')
+            
+            mutations_occurred.append('add_input_node')
         
         # 2. 删除输入节点突变
-        if random.random() < MUTATION_PROBABILITY['del_node'] * 0.5 and new_gene['n_input'] > 2:
-            # 确保保留至少2个输入节点
+        if random.random() < MUTATION_PROBABILITY['del_node'] * 0.5 and new_gene['n_input'] > 0:
+            # 允许删除所有输入节点，不再保留最小数量
             del_node_idx = random.randint(0, new_gene['n_input'] - 1)
             
             # 删除与此节点相关的所有连接
@@ -1102,31 +1103,31 @@ class Agent:
         
         # 3. 添加输出节点突变
         if random.random() < MUTATION_PROBABILITY['add_node'] * 0.5:
-            # 完全随机添加输出节点
-            if new_gene['n_output'] < 12:  # 限制最大数量
-                # 更新节点索引计算
-                output_start = new_gene['n_input'] + new_gene['n_hidden']
-                new_output_idx = output_start + new_gene['n_output']
-                
-                # 为新输出节点创建随机连接
+            # 完全随机添加输出节点，不限制最大数量
+            # 更新节点索引计算
+            output_start = new_gene['n_input'] + new_gene['n_hidden']
+            new_output_idx = output_start + new_gene['n_output']
+            
+            # 为新输出节点创建随机连接
+            if output_start > 0:  # 确保有源节点可连接
                 for _ in range(random.randint(1, 3)):
                     from_node = random.randint(0, output_start - 1)
                     new_gene['connections'].append([from_node, new_output_idx, random.uniform(-2, 2)])
-                
-                # 更新节点数量
-                new_gene['n_output'] += 1
-                
-                # 更新节点类型记录
-                if 'node_types' in new_gene:
-                    # 随机选择新节点类型
-                    new_type = random.choice(['movement', 'signal', 'energy', 'special'])
-                    new_gene['node_types']['output'].append(new_type)
-                
-                mutations_occurred.append('add_output_node')
+            
+            # 更新节点数量
+            new_gene['n_output'] += 1
+            
+            # 更新节点类型记录
+            if 'node_types' in new_gene:
+                # 随机选择新节点类型
+                new_type = random.choice(['movement', 'signal'])
+                new_gene['node_types']['output'].append(new_type)
+            
+            mutations_occurred.append('add_output_node')
         
         # 4. 删除输出节点突变
-        if random.random() < MUTATION_PROBABILITY['del_node'] * 0.5 and new_gene['n_output'] > 1:
-            # 确保保留至少1个输出节点
+        if random.random() < MUTATION_PROBABILITY['del_node'] * 0.5 and new_gene['n_output'] > 0:
+            # 允许删除所有输出节点，不再保留最小数量
             # 计算要删除的节点索引
             output_start = new_gene['n_input'] + new_gene['n_hidden']
             del_node_idx = output_start + random.randint(0, new_gene['n_output'] - 1)
@@ -1158,13 +1159,14 @@ class Agent:
             
             # 为新隐藏节点创建输入和输出连接
             # 输入连接
-            from_node = random.randint(0, hidden_start - 1)
-            new_gene['connections'].append([from_node, new_hidden_idx, random.uniform(-2, 2)])
+            if hidden_start > 0:  # 确保有源节点可连接
+                from_node = random.randint(0, hidden_start - 1)
+                new_gene['connections'].append([from_node, new_hidden_idx, random.uniform(-2, 2)])
             
             # 输出连接
-            to_node = random.randint(new_hidden_idx + 1, 
-                                     new_gene['n_input'] + new_gene['n_hidden'] + new_gene['n_output'])
-            if to_node < new_gene['n_input'] + new_gene['n_hidden'] + new_gene['n_output']:
+            total_nodes = new_gene['n_input'] + new_gene['n_hidden'] + new_gene['n_output']
+            if new_hidden_idx + 1 < total_nodes:  # 确保有目标节点可连接
+                to_node = random.randint(new_hidden_idx + 1, total_nodes - 1)
                 new_gene['connections'].append([new_hidden_idx, to_node, random.uniform(-2, 2)])
             
             # 更新节点数量
@@ -1172,9 +1174,8 @@ class Agent:
             
             # 更新节点类型记录
             if 'node_types' in new_gene:
-                # 随机选择新节点类型
-                new_type = random.choice(['standard', 'memory', 'processing', 'special'])
-                new_gene['node_types']['hidden'].append(new_type)
+                # 所有隐藏节点都是标准类型
+                new_gene['node_types']['hidden'].append('standard')
             
             mutations_occurred.append('add_hidden_node')
             
@@ -1209,18 +1210,23 @@ class Agent:
         # 7. 节点类型突变
         if 'node_types' in new_gene and random.random() < MUTATION_PROBABILITY['point'] * 0.5:
             # 随机选择一个节点类别
-            node_category = random.choice(['input', 'output', 'hidden'])
-            if new_gene['node_types'][node_category]:
+            valid_categories = []
+            for category in ['input', 'output', 'hidden']:
+                if category in new_gene['node_types'] and len(new_gene['node_types'][category]) > 0:
+                    valid_categories.append(category)
+            
+            if valid_categories:  # 只有在有有效类别时才进行突变
+                node_category = random.choice(valid_categories)
                 # 随机选择该类别中的一个节点
                 node_idx = random.randint(0, len(new_gene['node_types'][node_category]) - 1)
                 
                 # 根据类别提供不同的可能类型
                 if node_category == 'input':
-                    new_type = random.choice(['general', 'field_sense', 'signal_sense', 'special'])
+                    new_type = random.choice(['field_sense', 'signal_sense'])
                 elif node_category == 'output':
-                    new_type = random.choice(['movement', 'signal', 'energy', 'special'])
+                    new_type = random.choice(['movement', 'signal'])
                 else:  # hidden
-                    new_type = random.choice(['standard', 'memory', 'processing', 'special'])
+                    new_type = 'standard'  # 隐藏节点只有标准类型
                 
                 # 应用新类型
                 new_gene['node_types'][node_category][node_idx] = new_type
@@ -1263,7 +1269,7 @@ class Agent:
         color.hsva = (hue, 85, 90, 100)
         
         # 根据能量水平调整亮度
-        energy_ratio = min(1.0, self.energy / self.e_repro)
+        energy_ratio = min(1.0, self.energy / max(0.1, self.e_repro))
         if energy_ratio < 0.3:
             # 能量不足时颜色变暗
             _, s, v, _ = color.hsva
@@ -1354,7 +1360,6 @@ class Universe:
         
         # 创建初始智能体 - 确保位置不重叠
         self.agents = []
-        min_safe_distance = AGENT_RADIUS * 3.0  # 安全距离
         occupied_positions = []
         
         # 创建指定数量的初始智能体
@@ -1378,7 +1383,7 @@ class Universe:
                     dy = min(abs(candidate_pos.y - existing_pos.y), WORLD_SIZE - abs(candidate_pos.y - existing_pos.y))
                     dist_sq = dx * dx + dy * dy
                     
-                    if dist_sq < min_safe_distance * min_safe_distance:
+                    if dist_sq < AGENT_RADIUS * 3.0 * AGENT_RADIUS * 3.0:
                         valid_position = False
                         break
                 
@@ -1390,34 +1395,10 @@ class Universe:
                     occupied_positions.append(candidate_pos)
                     break
             
-            # 如果无法找到有效位置，记录警告并尝试使用更小的安全距离
-            if not valid_position and min_safe_distance > AGENT_RADIUS:
-                min_safe_distance *= 0.9  # 逐步减小安全距离
+            # 如果无法找到有效位置，记录警告
+            if not valid_position:
                 self.logger.log_event(0, 'SPAWN_WARNING', 
-                                    {'message': f'Reducing safe distance to {min_safe_distance:.2f}'})
-                
-                # 再次尝试创建智能体
-                for _ in range(max_attempts):
-                    candidate_pos = Vector2(
-                        random.uniform(0, WORLD_SIZE),
-                        random.uniform(0, WORLD_SIZE)
-                    )
-                    
-                    valid_position = True
-                    for existing_pos in occupied_positions:
-                        dx = min(abs(candidate_pos.x - existing_pos.x), WORLD_SIZE - abs(candidate_pos.x - existing_pos.x))
-                        dy = min(abs(candidate_pos.y - existing_pos.y), WORLD_SIZE - abs(candidate_pos.y - existing_pos.y))
-                        dist_sq = dx * dx + dy * dy
-                        
-                        if dist_sq < min_safe_distance * min_safe_distance:
-                            valid_position = False
-                            break
-                    
-                    if valid_position:
-                        agent = Agent(self, self.logger, position=candidate_pos)
-                        self.agents.append(agent)
-                        occupied_positions.append(candidate_pos)
-                        break
+                                    {'message': f'无法为智能体 #{_+1} 找到合适位置'})
         
         # 记录实际创建的智能体数量
         actual_count = len(self.agents)
@@ -1615,6 +1596,56 @@ class Universe:
         self.biotic_field_1.grid *= (1 - BIOTIC_FIELD_SPECIAL_DECAY * dt)
         self.biotic_field_2.grid *= (1 - BIOTIC_FIELD_SPECIAL_DECAY * dt)
 
+    def _spawn_new_agents(self):
+        """生成新的随机智能体"""
+        # 计算需要添加的智能体数量，确保达到最小数量
+        agents_to_add = MIN_AGENTS_TO_SPAWN - len(self.agents)
+        if agents_to_add <= 0:
+            return
+            
+        self.logger.log_event(self.frame_count, 'SPAWN_NEW', 
+                             {'count': agents_to_add, 'reason': 'below_minimum'})
+        
+        new_agents = []
+        for _ in range(agents_to_add):
+            # 尝试找到一个不重叠的位置
+            max_attempts = 30  # 每个智能体尝试位置的最大次数
+            new_pos = None
+            min_safe_distance = AGENT_RADIUS * 3.0  # 安全距离
+            
+            # 缓存所有现有智能体位置
+            existing_positions = [agent.position for agent in self.agents if not agent.is_dead]
+            
+            for _ in range(max_attempts):
+                candidate_pos = Vector2(random.uniform(0, WORLD_SIZE), random.uniform(0, WORLD_SIZE))
+                
+                # 检查是否与现有智能体重叠
+                is_valid = True
+                for pos in existing_positions:
+                    # 考虑周期性边界条件计算距离
+                    dx = min(abs(candidate_pos.x - pos.x), WORLD_SIZE - abs(candidate_pos.x - pos.x))
+                    dy = min(abs(candidate_pos.y - pos.y), WORLD_SIZE - abs(candidate_pos.y - pos.y))
+                    dist_sq = dx * dx + dy * dy
+                    
+                    if dist_sq < min_safe_distance * min_safe_distance:
+                        is_valid = False
+                        break
+                
+                if is_valid:
+                    new_pos = candidate_pos
+                    break
+            
+            # 只有找到合适位置才创建新智能体
+            if new_pos:
+                new_agents.append(Agent(self, self.logger, position=new_pos))
+        
+        self.agents.extend(new_agents)
+        
+        # 记录实际添加的智能体数量
+        if len(new_agents) < agents_to_add:
+            self.logger.log_event(self.frame_count, 'SPAWN_WARNING', 
+                                {'message': f'只能添加 {len(new_agents)}/{agents_to_add} 个智能体，因为空间限制'})
+    
     def update(self, dt):
         """更新宇宙状态"""
         if self.perf_monitor:
@@ -1667,56 +1698,6 @@ class Universe:
         if self.perf_monitor:
             self.perf_monitor.end_update()
     
-    def _spawn_new_agents(self):
-        """生成新的随机智能体"""
-        # 计算需要添加的智能体数量，确保达到最小数量
-        agents_to_add = MIN_AGENTS_TO_SPAWN - len(self.agents)
-        if agents_to_add <= 0:
-            return
-            
-        self.logger.log_event(self.frame_count, 'SPAWN_NEW', 
-                             {'count': agents_to_add, 'reason': 'below_minimum'})
-        
-        new_agents = []
-        for _ in range(agents_to_add):
-            # 尝试找到一个不重叠的位置
-            max_attempts = 30  # 增加尝试次数
-            new_pos = None
-            min_safe_distance = AGENT_RADIUS * 3.0  # 增加安全距离
-            
-            # 缓存所有现有智能体位置
-            existing_positions = [agent.position for agent in self.agents if not agent.is_dead]
-            
-            for _ in range(max_attempts):
-                candidate_pos = Vector2(random.uniform(0, WORLD_SIZE), random.uniform(0, WORLD_SIZE))
-                
-                # 检查是否与现有智能体重叠
-                is_valid = True
-                for pos in existing_positions:
-                    # 考虑周期性边界条件计算距离
-                    dx = min(abs(candidate_pos.x - pos.x), WORLD_SIZE - abs(candidate_pos.x - pos.x))
-                    dy = min(abs(candidate_pos.y - pos.y), WORLD_SIZE - abs(candidate_pos.y - pos.y))
-                    dist_sq = dx * dx + dy * dy
-                    
-                    if dist_sq < min_safe_distance * min_safe_distance:
-                        is_valid = False
-                        break
-                
-                if is_valid:
-                    new_pos = candidate_pos
-                    break
-            
-            # 只有找到合适位置才创建新智能体
-            if new_pos:
-                new_agents.append(Agent(self, self.logger, position=new_pos))
-        
-        self.agents.extend(new_agents)
-        
-        # 记录实际添加的智能体数量
-        if len(new_agents) < agents_to_add:
-            self.logger.log_event(self.frame_count, 'SPAWN_WARNING', 
-                                {'message': f'只能添加 {len(new_agents)}/{agents_to_add} 个智能体，因为空间限制'})
-    
     def _cull_excess_agents(self):
         """淘汰多余的智能体"""
         self.agents.sort(key=lambda a: a.energy)
@@ -1730,7 +1711,7 @@ class Universe:
         self.agents = self.agents[num_to_remove:]
         self.logger.log_event(self.frame_count, 'CULL', 
                              {'count': num_to_remove, 'culled_ids': culled_ids})
-
+    
     def draw(self, surface, sim_surface):
         """绘制整个宇宙 - 使用批量渲染优化"""
         # 在无GUI模式下跳过渲染
@@ -1814,7 +1795,7 @@ class Universe:
             radius = max(1, int(agent.radius * self.camera.zoom))
             
             # 根据能量水平调整亮度
-            energy_ratio = min(1.0, agent.energy / agent.e_repro)
+            energy_ratio = min(1.0, agent.energy / max(0.1, agent.e_repro))
             agent_color = color
             
             if energy_ratio < 0.3:
@@ -1952,14 +1933,16 @@ def draw_neural_network(surface, font, agent, x, y, width, height, mouse_pos):
     
     # 为所有节点类型创建标签
     input_labels = []
-    basic_input_labels = ["N_v", "N_gx", "N_gy", "H_v", "H_gx", "H_gy", "B1_v", "B1_gx", "B1_gy", "B2_v", "B2_gx", "B2_gy"]
+    # 使用统一的signal命名方式
+    basic_input_labels = ["Energy_v", "Energy_gx", "Energy_gy", "Hazard_v", "Hazard_gx", "Hazard_gy", 
+                         "Signal1_v", "Signal1_gx", "Signal1_gy", "Signal2_v", "Signal2_gx", "Signal2_gy"]
     signal_in_count = 0
     for i in range(n_in):
         node_type = None
         if 'node_types' in agent.gene and 'input' in agent.gene['node_types'] and i < len(agent.gene['node_types']['input']):
             node_type = agent.gene['node_types']['input'][i]
         if node_type == 'signal_sense':
-            input_labels.append(f"SigIn_{signal_in_count+1}")
+            input_labels.append(f"Signal{signal_in_count+3}_v")
             signal_in_count += 1
         elif i < len(basic_input_labels):
             input_labels.append(basic_input_labels[i])
@@ -1975,7 +1958,7 @@ def draw_neural_network(surface, font, agent, x, y, width, height, mouse_pos):
         output_labels.append("MoveY")
     # 信号输出
     for i in range(2, n_out):
-        output_labels.append(f"Sig_{i-1}")
+        output_labels.append(f"Signal_{i-1}")
     
     # 设置列位置
     col_x = [x + 30, x + width // 2, x + width - 30]
@@ -2123,8 +2106,10 @@ class PerformanceMonitor:
             self.agent_counts.pop(0)
         
         # 计算FPS
-        if self.frame_times:
+        if self.frame_times and sum(self.frame_times) > 0:
             self.fps = 1.0 / (sum(self.frame_times) / len(self.frame_times))
+        else:
+            self.fps = 0
     
     def start_update(self):
         self.update_start_time = time.time()
@@ -2134,7 +2119,10 @@ class PerformanceMonitor:
         self.update_times.append(update_time)
         if len(self.update_times) > 100:
             self.update_times.pop(0)
-        self.avg_update_time = sum(self.update_times) / len(self.update_times)
+        if self.update_times:
+            self.avg_update_time = sum(self.update_times) / len(self.update_times)
+        else:
+            self.avg_update_time = 0
     
     def start_render(self):
         self.render_start_time = time.time()
@@ -2144,7 +2132,10 @@ class PerformanceMonitor:
         self.render_times.append(render_time)
         if len(self.render_times) > 100:
             self.render_times.pop(0)
-        self.avg_render_time = sum(self.render_times) / len(self.render_times)
+        if self.render_times:
+            self.avg_render_time = sum(self.render_times) / len(self.render_times)
+        else:
+            self.avg_render_time = 0
     
     def get_stats(self):
         return {
