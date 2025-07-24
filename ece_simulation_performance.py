@@ -11,7 +11,8 @@
 # 3. [保留] 封闭能量系统：所有能量均来自模拟开始时的一次性投放
 # 4. [保留] 严格碰撞物理：智能体之间不再重叠，实现为硬球模型
 # =============================================================================
-
+import multiprocessing
+from multiprocessing import Queue
 import pygame
 import numpy as np
 import random
@@ -34,12 +35,12 @@ import base64
 # 1. 宇宙设定
 INITIAL_SCREEN_WIDTH = 1200 
 INITIAL_SCREEN_HEIGHT = 800
-WORLD_SIZE = 512
+WORLD_SIZE = 2048
 INFO_PANEL_WIDTH = 400
 
 # 2. 演化引擎参数
 INITIAL_AGENT_COUNT = 100  # 初始智能体数量设置为100
-MAX_AGENTS = 500          # 限制最大智能体数量为500
+MAX_AGENTS = 1000          # 限制最大智能体数量为500
 MIN_AGENTS_TO_SPAWN = 100  # 如果智能体数量低于100，就补充
 MUTATION_PROBABILITY = {
     'point': 0.03, 'add_conn': 0.015, 'del_conn': 0.015,
@@ -67,7 +68,7 @@ OVERLAP_EMERGENCY_DISTANCE = 0.5  # 紧急情况下的额外排斥距离
 MIN_MOVEMENT_JITTER = 0     # 最小随机移动量，确保所有生物都会动
 REPULSION_PRIORITY = 0       # 排斥力优先级，确保排斥力优先于神经网络输出
 ENERGY_PATCH_RADIUS_MIN = 60.0 # 能量辐射最小范围 (原来是30)
-ENERGY_PATCH_RADIUS_MAX = 120.0 # 能量辐射最大范围 (原来是60)
+ENERGY_PATCH_RADIUS_MAX = 400.0 # 能量辐射最大范围 (原来是60)
 ENERGY_GRADIENT_FACTOR = 0.6   # 能量梯度因子，越小梯度越缓
 SPAWN_SAFE_DISTANCE = AGENT_RADIUS * 3.0  # 生成新智能体时的安全距离
 
@@ -90,246 +91,174 @@ AGENT_RENDER_BATCH_SIZE = 50  # 智能体渲染批次大小
 USE_SURFACE_CACHING = True  # 使用表面缓存
 SIGNAL_RENDER_THRESHOLD = 0.2  # 信号渲染阈值
 
+
+def logging_process_worker(log_queue, log_dir, continue_from, headers):
+    """
+    这个函数在独立的进程中运行，专门处理日志写入。
+    它从队列中接收数据，执行耗时的编码和磁盘写入操作。
+    """
+    # 在新进程中定义文件路径
+    state_log_path = os.path.join(log_dir, "simulation_log.csv")
+    event_log_path = os.path.join(log_dir, "event_log.csv")
+    field_log_path = os.path.join(log_dir, "field_log.csv")
+    signal_types_path = os.path.join(log_dir, "signal_types.json")
+
+    # 如果不是继续模拟，则创建新文件并写入表头
+    if not continue_from:
+        with open(state_log_path, 'w', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow(headers['state'])
+        with open(event_log_path, 'w', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow(headers['event'])
+        with open(field_log_path, 'w', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow(headers['field'])
+
+    # 持续从队列中获取数据并写入
+    while True:
+        try:
+            log_item = log_queue.get()
+            if log_item is None:  # 收到结束信号
+                break
+
+            log_type, data = log_item
+            if log_type == 'state':
+                with open(state_log_path, 'a', newline='', encoding='utf-8') as f:
+                    csv.writer(f).writerows(data)
+            elif log_type == 'event':
+                 with open(event_log_path, 'a', newline='', encoding='utf-8') as f:
+                    csv.writer(f).writerows(data)
+            elif log_type == 'field':
+                frame, field_name, grid_data = data
+                # 在这个进程里进行耗时的编码操作
+                field_bytes = grid_data.tobytes()
+                encoded_data = base64.b64encode(field_bytes).decode('ascii')
+                with open(field_log_path, 'a', newline='', encoding='utf-8') as f:
+                    csv.writer(f).writerow([frame, field_name, encoded_data])
+            elif log_type == 'signal_types':
+                with open(signal_types_path, 'w', encoding='utf-8') as f:
+                    json.dump(list(data), f)
+
+        except Exception as e:
+            # 在日志进程中打印错误，避免主进程崩溃
+            print(f"[Logging Process Error]: {e}")
+
+
+# --- 数据日志系统 ---
 # --- 数据日志系统 ---
 class DataLogger:
-    def __init__(self, continue_from=None):
-        # 创建新的日志目录
-        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.log_dir = os.path.join("logs", f"run_{timestamp}")
-        os.makedirs(self.log_dir, exist_ok=True)
+    def __init__(self, log_queue, continue_from=None):
+        self.log_queue = log_queue
+        self.continue_from = continue_from
         
         if continue_from:
-            # 从指定的日志目录继续模拟，但写入新目录
-            self.continue_from_existing = True
-            self.source_log_dir = continue_from
-            
-            # 读取现有日志文件以获取最后一帧和智能体ID计数器
             self.agent_id_counter = self._get_max_agent_id(continue_from)
             self.last_frame = self._get_last_frame(continue_from)
-            
-            # 复制旧日志文件到新目录
-            self._copy_log_files(continue_from)
-            
-            print(f"继续从日志 {continue_from} 的第 {self.last_frame} 帧开始模拟，新日志保存在 {self.log_dir}")
         else:
-            # 全新的模拟
-            self.continue_from_existing = False
             self.agent_id_counter = 0
             self.last_frame = 0
-        
-        # 初始化日志文件路径
-        self.state_log_path = os.path.join(self.log_dir, "simulation_log.csv")
-        self.event_log_path = os.path.join(self.log_dir, "event_log.csv")
-        self.field_log_path = os.path.join(self.log_dir, "field_log.csv")
-        self.signal_types_path = os.path.join(self.log_dir, "signal_types.json")
-        
-        # 如果是全新模拟，创建新文件并写入表头
-        if not self.continue_from_existing:
-            self.state_header = ["frame", "agent_id", "parent_id", "genotype_id", "is_mutant", "energy", 
-                                "pos_x", "pos_y", "n_hidden", "n_connections", "gene_string"]
-            with open(self.state_log_path, 'w', newline='', encoding='utf-8') as f:
-                csv.writer(f).writerow(self.state_header)
 
-            self.event_header = ["frame", "event_type", "details"]
-            with open(self.event_log_path, 'w', newline='', encoding='utf-8') as f:
-                csv.writer(f).writerow(self.event_header)
-                
-            # 添加场景数据日志文件
-            self.field_header = ["frame", "field_type", "data"]
-            with open(self.field_log_path, 'w', newline='', encoding='utf-8') as f:
-                csv.writer(f).writerow(self.field_header)
-        
-        # 缓冲区，减少I/O操作
+        # 缓冲区，用于批量提交到队列
         self.state_buffer = []
         self.event_buffer = []
-        self.field_buffer = []  # 新增场数据缓冲区
-        self.buffer_size_limit = LOG_BUFFER_SIZE  # 使用全局配置
+        self.buffer_size_limit = LOG_BUFFER_SIZE
         self.last_flush_time = time.time()
-        self.flush_interval = LOG_FLUSH_INTERVAL  # 使用全局配置
-    
-    def _copy_log_files(self, source_dir):
-        """复制旧日志文件到新目录"""
-        try:
-            # 复制状态日志
-            source_state_log = os.path.join(source_dir, "simulation_log.csv")
-            if os.path.exists(source_state_log):
-                with open(source_state_log, 'r', newline='', encoding='utf-8') as src, \
-                     open(self.state_log_path, 'w', newline='', encoding='utf-8') as dst:
-                    dst.write(src.read())
-            
-            # 复制事件日志
-            source_event_log = os.path.join(source_dir, "event_log.csv")
-            if os.path.exists(source_event_log):
-                with open(source_event_log, 'r', newline='', encoding='utf-8') as src, \
-                     open(self.event_log_path, 'w', newline='', encoding='utf-8') as dst:
-                    dst.write(src.read())
-            
-            # 复制场数据日志
-            source_field_log = os.path.join(source_dir, "field_log.csv")
-            if os.path.exists(source_field_log):
-                with open(source_field_log, 'r', newline='', encoding='utf-8') as src, \
-                     open(self.field_log_path, 'w', newline='', encoding='utf-8') as dst:
-                    dst.write(src.read())
-            
-            # 复制信号类型日志
-            source_signal_types = os.path.join(source_dir, "signal_types.json")
-            if os.path.exists(source_signal_types):
-                with open(source_signal_types, 'r', encoding='utf-8') as src, \
-                     open(self.signal_types_path, 'w', encoding='utf-8') as dst:
-                    dst.write(src.read())
-            
-            print(f"已复制日志文件从 {source_dir} 到 {self.log_dir}")
-        except Exception as e:
-            print(f"复制日志文件时出错: {str(e)}")
-    
-    def _get_max_agent_id(self, log_dir=None):
-        """从现有日志中获取最大的智能体ID"""
-        max_id = 0
-        try:
-            path = os.path.join(log_dir or self.log_dir, "simulation_log.csv")
-            with open(path, 'r', encoding='utf-8') as f:
-                reader = csv.reader(f)
-                next(reader)  # 跳过表头
-                for row in reader:
-                    if len(row) > 1:
-                        agent_id = int(row[1])
-                        max_id = max(max_id, agent_id)
-        except Exception as e:
-            print(f"读取智能体ID时出错: {str(e)}")
-        return max_id
-    
-    def _get_last_frame(self, log_dir=None):
-        """从现有日志中获取最后一帧的帧号"""
-        last_frame = 0
-        try:
-            path = os.path.join(log_dir or self.log_dir, "simulation_log.csv")
-            with open(path, 'r', encoding='utf-8') as f:
-                reader = csv.reader(f)
-                next(reader)  # 跳过表头
-                for row in reader:
-                    if len(row) > 0:
-                        frame = int(row[0])
-                        last_frame = max(last_frame, frame)
-        except Exception as e:
-            print(f"读取最后一帧时出错: {str(e)}")
-        return last_frame
-    
-    def load_last_state(self):
-        """加载最后一帧的状态，用于恢复模拟"""
-        agents_data = []
-        try:
-            # 如果是继续模拟，从源日志目录读取
-            path = os.path.join(self.source_log_dir if hasattr(self, 'source_log_dir') else self.log_dir, "simulation_log.csv")
-            with open(path, 'r', encoding='utf-8') as f:
-                reader = csv.reader(f)
-                next(reader)  # 跳过表头
-                for row in reader:
-                    if len(row) > 0 and int(row[0]) == self.last_frame:
-                        agents_data.append(row)
-        except Exception as e:
-            print(f"加载最后状态时出错: {str(e)}")
-        return agents_data
-    
-    def load_signal_types(self):
-        """加载信号类型"""
-        signal_types = set()
-        try:
-            # 如果是继续模拟，从源日志目录读取
-            path = os.path.join(self.source_log_dir if hasattr(self, 'source_log_dir') else self.log_dir, "signal_types.json")
-            if os.path.exists(path):
-                with open(path, 'r', encoding='utf-8') as f:
-                    signal_types = set(json.load(f))
-        except Exception as e:
-            print(f"加载信号类型时出错: {str(e)}")
-        return signal_types
-    
-    def log_signal_types(self, signal_types):
-        """记录模拟中出现的信号类型"""
-        try:
-            with open(self.signal_types_path, 'w', encoding='utf-8') as f:
-                json.dump(list(signal_types), f)
-        except Exception as e:
-            print(f"记录信号类型错误: {str(e)}")
-    
+        self.flush_interval = LOG_FLUSH_INTERVAL
+
     def get_new_agent_id(self):
         self.agent_id_counter += 1
         return self.agent_id_counter
 
     def log_state(self, frame_number, agents):
-        # 将状态信息添加到缓冲区
         for agent in agents:
             gene_str = str(agent.gene)
             row = [frame_number, agent.id, agent.parent_id, agent.genotype_id, agent.is_mutant, 
-                  round(agent.energy, 2), round(agent.position.x, 2), round(agent.position.y, 2), 
-                  agent.gene['n_hidden'], len(agent.gene['connections']), gene_str]
+                   round(agent.energy, 2), round(agent.position.x, 2), round(agent.position.y, 2), 
+                   agent.gene['n_hidden'], len(agent.gene['connections']), gene_str]
             self.state_buffer.append(row)
-        
-        # 检查是否需要刷新缓冲区
         self._check_flush_buffer()
 
     def log_event(self, frame, event_type, details):
-        # 将事件信息添加到缓冲区
         details_str = json.dumps(details)
         self.event_buffer.append([frame, event_type, details_str])
-        
-        # 检查是否需要刷新缓冲区
         self._check_flush_buffer()
     
     def log_field(self, frame, fields):
-        # 记录场数据
-        for idx, field in enumerate(fields):
-            # 将numpy数组转换为压缩的base64字符串
-            field_data = np.array(field.grid, dtype=np.float32)
-            field_bytes = field_data.tobytes()
-            encoded_data = base64.b64encode(field_bytes).decode('ascii')
+        # 只把原始的、廉价的数据放入队列
+        # 耗时的base64编码将由日志进程完成
+        for field in fields:
+            grid_data = np.array(field.grid, dtype=np.float32)
+            self.log_queue.put(('field', (frame, field.name, grid_data)))
             
-            self.field_buffer.append([frame, field.name, encoded_data])
-        
-        # 检查是否需要刷新缓冲区
-        self._check_flush_buffer()
-    
+    def log_signal_types(self, signal_types):
+        self.log_queue.put(('signal_types', signal_types))
+
     def _check_flush_buffer(self):
-        # 如果缓冲区达到大小限制或者距离上次刷新已经过了指定时间，则刷新缓冲区
         current_time = time.time()
-        if (len(self.state_buffer) + len(self.event_buffer) + len(self.field_buffer) > self.buffer_size_limit or
-            current_time - self.last_flush_time > self.flush_interval):
+        buffer_full = (len(self.state_buffer) + len(self.event_buffer)) >= self.buffer_size_limit
+        time_to_flush = current_time - self.last_flush_time > self.flush_interval
+        
+        if buffer_full or time_to_flush:
             self._flush_buffers()
-    
+
     def _flush_buffers(self):
-        """刷新缓冲区到文件"""
+        if self.state_buffer:
+            self.log_queue.put(('state', self.state_buffer))
+            self.state_buffer = []
+        if self.event_buffer:
+            self.log_queue.put(('event', self.event_buffer))
+            self.event_buffer = []
+        self.last_flush_time = time.time()
+
+    def _get_max_agent_id(self, log_dir):
+        # ... (这个函数和后面的 _get_last_frame, load_last_state 等保持不变，用于初始化) ...
+        max_id = 0
         try:
-            # 刷新状态缓冲区
-            if self.state_buffer:
-                with open(self.state_log_path, 'a', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
-                    writer.writerows(self.state_buffer)
-                self.state_buffer = []
-            
-            # 刷新事件缓冲区
-            if self.event_buffer:
-                with open(self.event_log_path, 'a', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
-                    writer.writerows(self.event_buffer)
-                self.event_buffer = []
-                
-            # 刷新场数据缓冲区
-            if self.field_buffer:
-                with open(self.field_log_path, 'a', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
-                    writer.writerows(self.field_buffer)
-                self.field_buffer = []
-            
-            # 更新最后刷新时间
-            self.last_flush_time = time.time()
-        except Exception as e:
-            print(f"日志刷新错误: {str(e)}")
-    
+            path = os.path.join(log_dir, "simulation_log.csv")
+            with open(path, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                next(reader)
+                for row in reader:
+                    if len(row) > 1: max_id = max(max_id, int(row[1]))
+        except Exception: pass
+        return max_id
+
+    def _get_last_frame(self, log_dir):
+        last_frame = 0
+        try:
+            path = os.path.join(log_dir, "simulation_log.csv")
+            with open(path, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                next(reader)
+                for row in reader:
+                    if len(row) > 0: last_frame = max(last_frame, int(row[0]))
+        except Exception: pass
+        return last_frame
+
+    def load_last_state(self):
+        agents_data = []
+        try:
+            path = os.path.join(self.continue_from, "simulation_log.csv")
+            with open(path, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                next(reader)
+                for row in reader:
+                    if len(row) > 0 and int(row[0]) == self.last_frame:
+                        agents_data.append(row)
+        except Exception: pass
+        return agents_data
+
+    def load_signal_types(self):
+        signal_types = set()
+        try:
+            path = os.path.join(self.continue_from, "signal_types.json")
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    signal_types = set(json.load(f))
+        except Exception: pass
+        return signal_types
+
     def __del__(self):
-        """确保在对象被销毁时刷新所有缓冲区"""
-        try:
-            self._flush_buffers()
-        except Exception as e:
-            print(f"日志销毁时错误: {e}")
+        # 确保退出时刷新所有剩余的缓冲数据
+        self._flush_buffers()
 
 # --- 相机系统 ---
 class Camera:
@@ -1954,220 +1883,153 @@ class PerformanceMonitor:
 
 def main():
     """主函数"""
-    # 解析命令行参数
     parser = argparse.ArgumentParser(description="涌现认知生态系统 (ECE) v5.0")
     parser.add_argument("--no-gui", action="store_true", help="无GUI模式，仅运行计算")
-    parser.add_argument("--continue-from", type=str, help="从指定的日志目录继续模拟，新日志将保存在新的日志目录中")
+    parser.add_argument("--continue-from", type=str, help="从指定的日志目录继续模拟")
     args = parser.parse_args()
     
-    # 使用GUI模式
     use_gui = not args.no_gui
+    continue_simulation = bool(args.continue_from)
+
+    # <<< 1. 创建日志目录、队列和独立的日志进程 >>>
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = os.path.join("logs", f"run_{timestamp}")
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+
+    log_queue = Queue()
     
-    # 初始化数据记录器
-    if args.continue_from:
-        logger = DataLogger(args.continue_from)
-        continue_simulation = True
-    else:
-        logger = DataLogger()
-        continue_simulation = False
+    # 定义日志文件的表头
+    headers = {
+        'state': ["frame", "agent_id", "parent_id", "genotype_id", "is_mutant", "energy", 
+                  "pos_x", "pos_y", "n_hidden", "n_connections", "gene_string"],
+        'event': ["frame", "event_type", "details"],
+        'field': ["frame", "field_type", "data"]
+    }
+
+    log_proc = multiprocessing.Process(
+        target=logging_process_worker,
+        args=(log_queue, log_dir, args.continue_from, headers),
+        daemon=True # 设置为守护进程，主进程退出时它也会退出
+    )
+    log_proc.start()
+
+    # <<< 2. 将队列传递给DataLogger >>>
+    logger = DataLogger(log_queue, args.continue_from)
     
-    # 如果使用GUI模式，初始化pygame
     if use_gui:
-        # 设置窗口位置居中
         os.environ['SDL_VIDEO_CENTERED'] = '1'
-        
-        # 设置Pygame以提高性能
         pygame.init()
         pygame.display.set_caption("涌现认知生态系统 (ECE) v5.0 - 高性能版")
-        
-        # 设置显示模式
         flags = pygame.HWSURFACE | pygame.DOUBLEBUF | pygame.RESIZABLE
         screen = pygame.display.set_mode((INITIAL_SCREEN_WIDTH, INITIAL_SCREEN_HEIGHT), flags)
-        
-        # 使用硬件加速
-        if pygame.display.get_driver() == 'windows':
-            # 在Windows上尝试使用DirectX
-            os.environ['SDL_VIDEODRIVER'] = 'directx'
-        
-        # 移除帧率限制
         clock = pygame.time.Clock()
-        
-        # 设置字体
         try: 
             font = pygame.font.SysFont("simhei", 16)
         except pygame.error: 
             font = pygame.font.SysFont(None, 22)
-        
-        # 设置模拟区域大小
         current_screen_width, current_screen_height = screen.get_size()
         sim_area_width = current_screen_width - INFO_PANEL_WIDTH
     else:
-        # 无GUI模式
         print("以无GUI模式运行，仅进行计算...")
         sim_area_width = INITIAL_SCREEN_WIDTH - INFO_PANEL_WIDTH
         current_screen_height = INITIAL_SCREEN_HEIGHT
     
-    # 创建宇宙
     universe = Universe(logger, sim_area_width, current_screen_height, use_gui, continue_simulation)
     
-    # 记录模拟开始事件
     if not continue_simulation:
         logger.log_event(0, 'SIM_START', {'initial_agents': INITIAL_AGENT_COUNT, 'world_size': WORLD_SIZE, 'gui_mode': use_gui})
     else:
         logger.log_event(universe.frame_count, 'SIM_CONTINUE', {'agents': len(universe.agents), 'from_frame': universe.frame_count})
     
-    # 控制变量
     running = True
     paused = False
     last_performance_update = 0
-    
-    # 渲染优化变量
-    render_every_n_frames = DEFAULT_RENDER_SKIP  # 使用默认配置
+    render_every_n_frames = DEFAULT_RENDER_SKIP
     frame_counter = 0
     
-    # 主循环
-    while running:
-        frame_counter += 1
-        render_this_frame = frame_counter % render_every_n_frames == 0
-        
-        if universe.perf_monitor and render_this_frame:
-            universe.perf_monitor.start_frame()
+    try:
+        while running:
+            frame_counter += 1
+            render_this_frame = frame_counter % render_every_n_frames == 0
             
-        # GUI模式下处理事件
-        if use_gui:
-            mouse_pos = pygame.mouse.get_pos()
-            
-            # 事件处理
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT: 
-                    running = False
+            if universe.perf_monitor and render_this_frame:
+                universe.perf_monitor.start_frame()
                 
-                # 窗口大小调整
-                if event.type == pygame.VIDEORESIZE:
-                    current_screen_width, current_screen_height = event.size
-                
-                # 相机事件处理
-                universe.camera.handle_event(event, mouse_pos)
-                
-                # 鼠标点击
-                if event.type == pygame.MOUSEBUTTONDOWN:
-                    if event.button == 1 and mouse_pos[0] < universe.camera.render_width:
-                        universe.handle_click(event.pos)
-                        
-                # 键盘控制
-                if event.type == pygame.KEYDOWN:
-                    # 空格暂停/继续
-                    if event.key == pygame.K_SPACE: 
-                        paused = not paused
-                        
-                    # 右箭头在暂停时单步执行
-                    if event.key == pygame.K_RIGHT and paused: 
-                        universe.update(0.016)
-                        
-                    # F11全屏切换
-                    if event.key == pygame.K_F11:
-                        pygame.display.toggle_fullscreen()
-                        
-                    # 数字键切换视图模式
-                    if event.key == pygame.K_0:
-                        universe.view_mode = 0
-                    elif event.key == pygame.K_1:
-                        universe.view_mode = 1
-                    elif event.key == pygame.K_2:
-                        universe.view_mode = 2
-                    elif event.key == pygame.K_3:
-                        universe.view_mode = 3
-                    elif event.key == pygame.K_4:
-                        universe.view_mode = 4
-                        
-                    # 优化键 - 调整渲染频率
-                    elif event.key == pygame.K_F1:
-                        render_every_n_frames = 1  # 每帧渲染
-                    elif event.key == pygame.K_F2:
-                        render_every_n_frames = 2  # 每2帧渲染
-                    elif event.key == pygame.K_F3:
-                        render_every_n_frames = 3  # 每3帧渲染
-        else:
-            # 无GUI模式下简单处理中断信号
-            try:
-                # 每100帧输出一次状态信息
+            if use_gui:
+                mouse_pos = pygame.mouse.get_pos()
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT: running = False
+                    if event.type == pygame.VIDEORESIZE:
+                        current_screen_width, current_screen_height = event.size
+                    universe.camera.handle_event(event, mouse_pos)
+                    if event.type == pygame.MOUSEBUTTONDOWN:
+                        if event.button == 1 and mouse_pos[0] < universe.camera.render_width:
+                            universe.handle_click(event.pos)
+                    if event.type == pygame.KEYDOWN:
+                        if event.key == pygame.K_SPACE: paused = not paused
+                        if event.key == pygame.K_RIGHT and paused: universe.update(0.016)
+                        if event.key == pygame.K_F11: pygame.display.toggle_fullscreen()
+                        if event.key == pygame.K_0: universe.view_mode = 0
+                        elif event.key == pygame.K_1: universe.view_mode = 1
+                        elif event.key == pygame.K_2: universe.view_mode = 2
+                        elif event.key == pygame.K_3: universe.view_mode = 3
+                        elif event.key == pygame.K_4: universe.view_mode = 4
+                        elif event.key == pygame.K_F1: render_every_n_frames = 1
+                        elif event.key == pygame.K_F2: render_every_n_frames = 2
+                        elif event.key == pygame.K_F3: render_every_n_frames = 3
+            else:
                 if universe.frame_count % 100 == 0:
                     total_biomass = sum(agent.energy for agent in universe.agents)
                     print(f"帧: {universe.frame_count} | 生命体: {len(universe.agents)}/{MAX_AGENTS} | 总生物量: {int(total_biomass)}")
-            except KeyboardInterrupt:
-                print("收到中断信号，正在退出...")
-                running = False
+            
+            if not paused:
+                universe.update(0.016)
+            
+            if use_gui and render_this_frame:
+                screen.fill((0,0,0))
+                current_screen_width, current_screen_height = screen.get_size()
+                sim_area_width = current_screen_width - INFO_PANEL_WIDTH
+                if sim_area_width < 400: sim_area_width = 400
+                info_panel_width = current_screen_width - sim_area_width
+                universe.camera.update_render_size(sim_area_width, current_screen_height)
+                sim_surface = pygame.Surface((sim_area_width, current_screen_height))
+                universe.draw(screen, sim_surface)
+                draw_inspector_panel(screen, font, universe.selected_agent, mouse_pos, sim_area_width, info_panel_width, current_screen_height)
+                view_name = "全部"
+                if 1 <= universe.view_mode <= len(universe.fields):
+                    view_name = universe.fields[universe.view_mode - 1].name
+                total_biomass = sum(agent.energy for agent in universe.agents)
+                performance_info = ""
+                if universe.perf_monitor and universe.frame_count - last_performance_update > UPDATE_INTERVAL:
+                    stats = universe.perf_monitor.get_stats()
+                    performance_info = f" | FPS: {stats['fps']} | 更新: {stats['update_ms']}ms | 渲染: {stats['render_ms']}ms"
+                    last_performance_update = universe.frame_count
+                info_text = f"帧: {universe.frame_count} | 生命体: {len(universe.agents)}/{MAX_AGENTS} ({universe.next_genotype_id}个基因型) | 总生物量: {int(total_biomass)} | 视图(0-4): {view_name}{performance_info} | {'[已暂停]' if paused else ''}"
+                text_surface = font.render(info_text, True, (255, 255, 255))
+                screen.blit(text_surface, (10, 10))
+                if render_every_n_frames > 1:
+                    render_text = f"渲染频率: 每{render_every_n_frames}帧 (F1-F3调整)"
+                    render_surface = font.render(render_text, True, (255, 200, 100))
+                    screen.blit(render_surface, (10, 30))
+                pygame.display.flip()
+                if universe.perf_monitor:
+                    universe.perf_monitor.end_frame(len(universe.agents))
+    except KeyboardInterrupt:
+        print("\n收到中断信号，正在退出...")
+        running = False
+    finally:
+        # <<< 3. 通知日志进程结束并等待它完成 >>>
+        print("主循环结束，正在等待日志进程完成...")
+        log_queue.put(None)  # 发送结束信号
+        log_proc.join(timeout=10) # 等待日志进程最多10秒
+        if log_proc.is_alive():
+            print("日志进程超时，强制终止。")
+            log_proc.terminate()
         
-        # 非暂停状态下更新模拟
-        if not paused:
-            # 使用固定的时间步长，提高模拟稳定性
-            fixed_dt = 0.016  # 约60FPS
-            universe.update(fixed_dt)
-        
-        # 只在需要渲染的帧上执行渲染，且仅在GUI模式下
-        if use_gui and render_this_frame:
-            # 清除屏幕
-            screen.fill((0,0,0))
-            
-            # 更新屏幕布局
-            current_screen_width, current_screen_height = screen.get_size()
-            sim_area_width = current_screen_width - INFO_PANEL_WIDTH
-            if sim_area_width < 400: 
-                sim_area_width = 400
-            info_panel_width = current_screen_width - sim_area_width
-            universe.camera.update_render_size(sim_area_width, current_screen_height)
-            
-            # 创建模拟表面
-            sim_surface = pygame.Surface((sim_area_width, current_screen_height))
-            
-            # 绘制宇宙和信息面板
-            universe.draw(screen, sim_surface)
-            draw_inspector_panel(screen, font, universe.selected_agent, mouse_pos, 
-                                sim_area_width, info_panel_width, current_screen_height)
-            
-            # 显示当前视图模式
-            view_name = "全部"
-            if 1 <= universe.view_mode <= len(universe.fields):
-                view_name = universe.fields[universe.view_mode - 1].name
-            
-            # 显示状态信息
-            total_biomass = sum(agent.energy for agent in universe.agents)
-            
-            # 性能统计
-            performance_info = ""
-            if universe.perf_monitor and universe.frame_count - last_performance_update > UPDATE_INTERVAL:
-                stats = universe.perf_monitor.get_stats()
-                performance_info = f" | FPS: {stats['fps']} | 更新: {stats['update_ms']}ms | 渲染: {stats['render_ms']}ms"
-                last_performance_update = universe.frame_count
-            
-            # 显示完整状态文本 - 恢复原有内容
-            info_text = f"帧: {universe.frame_count} | 生命体: {len(universe.agents)}/{MAX_AGENTS} ({universe.next_genotype_id}个基因型) | " \
-                       f"总生物量: {int(total_biomass)} | 视图(0-4): {view_name}{performance_info} | {'[已暂停]' if paused else ''}"
-            text_surface = font.render(info_text, True, (255, 255, 255))
-            screen.blit(text_surface, (10, 10))
-            
-            # 显示渲染频率
-            if render_every_n_frames > 1:
-                render_text = f"渲染频率: 每{render_every_n_frames}帧 (F1-F3调整)"
-                render_surface = font.render(render_text, True, (255, 200, 100))
-                screen.blit(render_surface, (10, 30))
-            
-            # 更新屏幕
-            pygame.display.flip()
-            
-            if universe.perf_monitor:
-                universe.perf_monitor.end_frame(len(universe.agents))
-            
-            # GUI模式下控制帧率
-            # clock.tick(60)  # 不限制帧率
-    
-    # 确保退出前刷新日志缓冲区
-    logger._flush_buffers()
-    
-    # 如果使用了pygame，则退出
-    if use_gui:
-        pygame.quit()
-    print("模拟结束")
+        if use_gui:
+            pygame.quit()
+        print("模拟结束")
 
 if __name__ == '__main__':
     main() 
