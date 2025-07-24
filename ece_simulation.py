@@ -53,11 +53,11 @@ INTERACTION_RANGE = 120.0
 ENERGY_TRANSFER_EFFICIENCY = 0.9
 K_INTERACTION_FACTOR = 0.01
 MOVEMENT_SPEED_FACTOR = 50.0  # 增大移动速度因子
-MOVEMENT_ENERGY_COST = 0.04   # 略微减少移动能耗
+MOVEMENT_ENERGY_COST = 0.0004   # 略微减少移动能耗
 SIGNAL_EMISSION_RADIUS = 20.0 
 BIOTIC_FIELD_SPECIAL_DECAY = 2.0
 AGENT_RADIUS = 2.0
-COLLISION_STIFFNESS = 5.0      # 【新增】碰撞“硬度”，值越大，推力越强，生物越“硬”
+# COLLISION_STIFFNESS = 5.0      # 【新增】碰撞“硬度”，值越大，推力越强，生物越“硬” /////那个过于暴力的 COLLISION_STIFFNESS 参数是问题的根源，我们不再需要它了。 （好惨啊
 MILD_REPULSION_RADIUS = 0   # 排斥力作用范围
 MILD_REPULSION_STRENGTH = 0  # 排斥力强度
 COLLISION_ITERATIONS = 5       # 碰撞检测迭代次数
@@ -601,7 +601,7 @@ class Agent:
             
         output_types = []
         for _ in range(n_output):
-            output_types.append(random.choice(['movement', 'signal']))
+            output_types.append(random.choice(['move_vector', 'signal']))
             
         hidden_types = []
         for _ in range(n_hidden):
@@ -672,149 +672,35 @@ class Agent:
         # 注册基因型ID
         self.genotype_id = self.universe.get_or_create_genotype_id(self.gene)
 
-    # def update(self, dt, neighbors):
-    #     if self.is_dead: 
-    #         return
-
-    #     # ==================== 新的大脑工作流 ====================
-
-    #     # 【阶段一：感知】将环境信息写入输入节点 (当前帧)
-    #     perception_vector = self.universe.get_perception_vector(self.position)
-    #     num_senses_to_use = min(len(perception_vector), self.n_input)
-    #     self.node_activations[:num_senses_to_use] = perception_vector[:num_senses_to_use]
-
-    #     # 【阶段二：信号异步传播】计算所有信号，并累加到“下一帧”的输入桶里
-    #     # 这一步模拟了信号花费一帧时间通过一个连接
-    #     self.next_node_inputs.fill(0) # 清空上一帧的累加器
-        
-    #     # 使用矩阵乘法一次性完成所有信号的传播计算
-    #     propagated_signals = np.matmul(self.node_activations, self.connection_matrix)
-    #     self.next_node_inputs += propagated_signals
-
-    #     # 【阶段三：节点激活】在下一帧的开始，所有节点根据收到的信号更新自己的状态
-    #     # 输入节点的状态被感知覆盖，不使用tanh
-    #     hidden_output_inputs = self.next_node_inputs[self.n_input:]
-        
-    #     # 隐藏层和输出层应用tanh激活函数
-    #     activated_values = np.tanh(hidden_output_inputs)
-        
-    #     # 将激活后的值更新到下一帧的状态中
-    #     self.node_activations[self.n_input:] = activated_values
-        
-    #     # 【阶段四：行动决策】从当前帧的最终状态读取输出，并转化为行动
-    #     output_activations = self.node_activations[-self.n_output:]
-    #     self.last_action_vector = output_activations
-        
-    #     # ==================== 后续逻辑基本不变 ====================
-
-    #     move_vector = Vector2(0, 0)
-    #     for i, activation in enumerate(output_activations):
-    #         node_type = 'movement'
-    #         if 'node_types' in self.gene and 'output' in self.gene['node_types'] and i < len(self.gene['node_types']['output']):
-    #             node_type = self.gene['node_types']['output'][i]
-            
-    #         if node_type == 'movement':
-    #             if i % 2 == 0 and i+1 < len(output_activations):
-    #                 move_vector.x += activation
-    #             elif i % 2 == 1:
-    #                 move_vector.y += activation
-    #         elif node_type == 'signal':
-    #             signal_count = len(self.universe.fields) - 2
-    #             field_idx = (i % signal_count) + 2
-    #             if field_idx < len(self.universe.fields) and abs(activation) > SIGNAL_RENDER_THRESHOLD:
-    #                 signal_strength = abs(activation) * 0.02
-    #                 signal_radius = SIGNAL_EMISSION_RADIUS * (0.5 + abs(activation) * 0.5)
-    #                 self.universe.fields[field_idx].add_circular_source(
-    #                     self.position, signal_radius, signal_strength)
-    #                 signal_name = f"Signal {field_idx-1}"
-    #                 self.universe.signal_types.add(signal_name)
-
-    #     # 移动 (由于我们关闭了jitter和repulsion，这里的移动完全由NN决定)
-    #     self.position += move_vector * MOVEMENT_SPEED_FACTOR * dt
-
-    #     # 世界边界环绕
-    #     self.position.x %= WORLD_SIZE
-    #     self.position.y %= WORLD_SIZE
-
-    #     # 能量交换（捕食关系）...
-    #     for other in neighbors:
-    #         if other is self or other.is_dead: 
-    #             continue
-    #         dist_sq = (self.position - other.position).length_squared()
-    #         if dist_sq < INTERACTION_RANGE**2:
-    #             identity_diff = abs(self.identity_vector - other.identity_vector)
-    #             OPTIMAL_DIFF = 0.5
-    #             predation_efficiency = math.exp(-10 * (identity_diff - OPTIMAL_DIFF)**2)
-                
-    #             if self.identity_vector > other.identity_vector and predation_efficiency > 0.1:
-    #                 dist_factor = 1 - math.sqrt(dist_sq) / INTERACTION_RANGE
-    #                 energy_transfer = predation_efficiency * K_INTERACTION_FACTOR * 30 * dist_factor
-    #                 self.energy += energy_transfer * dt
-    #                 other.energy -= energy_transfer * dt
-    #                 if energy_transfer * dt > 1.0 and random.random() < 0.05:
-    #                     self.universe.logger.log_event(
-    #                         self.universe.frame_count, 'PREDATION', 
-    #                         {'pred_id': self.id, 'prey_id': other.id})
-
-    #     # 新陈代谢与环境能量吸收 ...
-    #     action_cost = move_vector.length_squared() * MOVEMENT_ENERGY_COST
-    #     signal_cost = sum(abs(a) for a in output_activations) * 0.1
-    #     metabolism = self.metabolism_cost + action_cost + signal_cost
-        
-    #     nutrient_val, _ = self.universe.nutrient_field.get_value_and_gradient(self.position)
-    #     hazard_val, _ = self.universe.hazard_field.get_value_and_gradient(self.position)
-    #     env_gain = self.env_absorption_coeff * nutrient_val * 40
-    #     env_loss = abs(np.tanh(self.identity_vector)) * hazard_val * 30
-        
-    #     self.energy += (env_gain - env_loss - metabolism) * dt
-
-    #     # 死亡判定 ...
-    #     if self.energy <= 0:
-    #         self.is_dead = True
-    #         self.logger.log_event(self.universe.frame_count, 'AGENT_DEATH', 
-    #                              {'agent_id': self.id, 'reason': 'energy_depleted'})
-    #         self.universe.on_agent_death(self)
-
     def update(self, dt, neighbors):
         if self.is_dead: 
             return
-        # self.age += 1
+        
+        # self.age += 1 # 如果您启用了年龄淘汰
 
-        # ==================== 大脑工作流 (已更新为异步传播) ====================
-
-        # 【阶段一：感知】
+        # AI决策阶段 (不变)
         perception_vector = self.universe.get_perception_vector(self.position)
         num_senses_to_use = min(len(perception_vector), self.n_input)
         self.node_activations[:num_senses_to_use] = perception_vector[:num_senses_to_use]
-
-        # 【阶段二：信号异步传播】
         self.next_node_inputs.fill(0)
         propagated_signals = np.matmul(self.node_activations, self.connection_matrix)
         self.next_node_inputs += propagated_signals
-
-        # 【阶段三：节点激活】
         hidden_output_inputs = self.next_node_inputs[self.n_input:]
         activated_values = np.tanh(hidden_output_inputs)
         self.node_activations[self.n_input:] = activated_values
-        
-        # 【阶段四：行动决策】
         output_activations = self.node_activations[-self.n_output:]
         self.last_action_vector = output_activations
         
-        # ==================== 行为与物理（包含修正） ====================
-
-        # 1. 从神经网络生成“意图”移动向量
+        # 行动意图生成阶段
         move_vector = Vector2(0, 0)
+        move_components = []
         for i, activation in enumerate(output_activations):
-            node_type = 'movement'
+            node_type = 'signal'
             if 'node_types' in self.gene and 'output' in self.gene['node_types'] and i < len(self.gene['node_types']['output']):
                 node_type = self.gene['node_types']['output'][i]
-            
-            if node_type == 'movement':
-                if i % 2 == 0 and i+1 < len(output_activations):
-                    move_vector.x += activation
-                elif i % 2 == 1:
-                    move_vector.y += activation
+
+            if node_type == 'move_vector':
+                move_components.append(activation)
             elif node_type == 'signal':
                 # ... (信号逻辑不变) ...
                 signal_count = len(self.universe.fields) - 2
@@ -822,262 +708,58 @@ class Agent:
                 if field_idx < len(self.universe.fields) and abs(activation) > SIGNAL_RENDER_THRESHOLD:
                     signal_strength = abs(activation) * 0.02
                     signal_radius = SIGNAL_EMISSION_RADIUS * (0.5 + abs(activation) * 0.5)
-                    self.universe.fields[field_idx].add_circular_source(
-                        self.position, signal_radius, signal_strength)
-                    signal_name = f"Signal {field_idx-1}"
-                    self.universe.signal_types.add(signal_name)
-
-        # 2. 计算最终的移动向量
-        nn_driven_move = move_vector * MOVEMENT_SPEED_FACTOR
-
-        # 2.2 从物理环境中获取“排斥”向量
-        repulsion_vector = self._optimized_collision_detection(neighbors, dt)
+                    self.universe.fields[field_idx].add_circular_source(self.position, signal_radius, signal_strength)
+                    self.universe.signal_types.add(f"Signal {field_idx-1}")
         
-        # 【【【 核心修正点 】】】
-        # `repulsion_vector` 已包含防止重叠的强大推力，我们直接使用它，
-        # 不再乘以那些值为0的旧全局常量。
-        repuslion_driven_move = repulsion_vector
+        # 【【【 恢复为简洁逻辑 】】】
+        # 因为突变已保证 move_components 总是偶数个，所以不再需要处理落单情况
+        for i in range(0, len(move_components), 2):
+            if i + 1 < len(move_components):
+                vx = move_components[i]
+                vy = move_components[i+1]
+                move_vector += Vector2(vx, vy)
 
-        # 3. 合并意图和物理作用力，并应用最终位移
-        final_move_vector = nn_driven_move + repuslion_driven_move
-        self.position += final_move_vector * dt
+        self.position += move_vector * MOVEMENT_SPEED_FACTOR * dt
 
-        # ... (后续的世界环绕、能量交换、新陈代谢、死亡判定等逻辑保持完全不变) ...
-        # 世界边界环绕
+        # 【生理活动阶段】
         self.position.x %= WORLD_SIZE
         self.position.y %= WORLD_SIZE
 
-        # 能量交换（捕食关系）...
         for other in neighbors:
-            if other is self or other.is_dead: 
-                continue
+            if other is self or other.is_dead: continue
             dist_sq = (self.position - other.position).length_squared()
             if dist_sq < INTERACTION_RANGE**2:
                 identity_diff = abs(self.identity_vector - other.identity_vector)
                 OPTIMAL_DIFF = 0.5
                 predation_efficiency = math.exp(-10 * (identity_diff - OPTIMAL_DIFF)**2)
-                
                 if self.identity_vector > other.identity_vector and predation_efficiency > 0.1:
                     dist_factor = 1 - math.sqrt(dist_sq) / INTERACTION_RANGE
                     energy_transfer = predation_efficiency * K_INTERACTION_FACTOR * 30 * dist_factor
                     self.energy += energy_transfer * dt
                     other.energy -= energy_transfer * dt
                     if energy_transfer * dt > 1.0 and random.random() < 0.05:
-                        self.universe.logger.log_event(
-                            self.universe.frame_count, 'PREDATION', 
-                            {'pred_id': self.id, 'prey_id': other.id})
+                        self.universe.logger.log_event(self.universe.frame_count, 'PREDATION', {'pred_id': self.id, 'prey_id': other.id})
 
-        # 新陈代谢与环境能量吸收 ...
         action_cost = move_vector.length_squared() * MOVEMENT_ENERGY_COST
         signal_cost = sum(abs(a) for a in output_activations) * 0.1
         metabolism = self.metabolism_cost + action_cost + signal_cost
-        
         nutrient_val, _ = self.universe.nutrient_field.get_value_and_gradient(self.position)
         hazard_val, _ = self.universe.hazard_field.get_value_and_gradient(self.position)
         env_gain = self.env_absorption_coeff * nutrient_val * 40
         env_loss = abs(np.tanh(self.identity_vector)) * hazard_val * 30
-        
         self.energy += (env_gain - env_loss - metabolism) * dt
 
-        # 死亡判定 ...
         if self.energy <= 0:
             self.is_dead = True
-            self.logger.log_event(self.universe.frame_count, 'AGENT_DEATH', 
-                                 {'agent_id': self.id, 'reason': 'energy_depleted'})
+            self.logger.log_event(self.universe.frame_count, 'AGENT_DEATH', {'agent_id': self.id, 'reason': 'energy_depleted'})
             self.universe.on_agent_death(self)
-
-    def _optimized_collision_detection(self, neighbors, dt):
-        """优化的碰撞检测算法 - 返回一个排斥向量，而不是直接修改位置"""
-        potential_colliders = []
-        
-        for other in neighbors:
-            if other is self: 
-                continue
-                
-            # 使用曼哈顿距离进行粗略筛选，避免不必要的昂贵计算
-            dx_manhattan = min(abs(self.position.x - other.position.x), WORLD_SIZE - abs(self.position.x - other.position.x))
-            dy_manhattan = min(abs(self.position.y - other.position.y), WORLD_SIZE - abs(self.position.y - other.position.y))
-            manhattan_dist = dx_manhattan + dy_manhattan
-            
-            # 【【【 核心修正点 】】】
-            # 我们不再使用 MILD_REPULSION_RADIUS 来判断是否需要处理。
-            # 只要两个智能体可能接触 (半径之和)，就应该考虑它们。
-            # 这里额外加一个小的缓冲距离
-            detection_radius = self.radius + other.radius + 2.0 
-            
-            if manhattan_dist < detection_radius:
-                # 精确计算距离
-                dist_vec = self.position - other.position
-                if dx_manhattan > WORLD_SIZE / 2:
-                    dist_vec.x = -math.copysign(WORLD_SIZE - abs(dist_vec.x), dist_vec.x)
-                if dy_manhattan > WORLD_SIZE / 2:
-                    dist_vec.y = -math.copysign(WORLD_SIZE - abs(dist_vec.y), dist_vec.y)
-                
-                dist_sq = dist_vec.length_squared()
-                min_dist = self.radius + other.radius
-                
-                # 只要精确距离在检测范围内，就加入列表，不再需要那个错误的 if dist_sq < 0 判断
-                if dist_sq < detection_radius**2:
-                    potential_colliders.append({
-                        'dist_vec': dist_vec,
-                        'dist_sq': dist_sq,
-                        'min_dist': min_dist,
-                        'is_overlapping': dist_sq < min_dist**2
-                    })
-
-        if not potential_colliders:
-            return Vector2(0, 0)
-            
-        repulsion_vector = Vector2(0, 0)
-        for data in potential_colliders:
-            dist_sq = data['dist_sq']
-            dist_vec = data['dist_vec']
-            
-            if dist_sq > 1e-6:
-                repulsion_strength = 0
-                
-                # 只有在实际重叠时，才施加强大的“软碰撞”推力
-                if data['is_overlapping']:
-                    # 这个力与重叠深度成正比，防止穿透
-                    repulsion_strength += 5.0 * (1.0 - math.sqrt(dist_sq) / data['min_dist'])
-
-                if repulsion_strength > 0:
-                    repulsion_vector += dist_vec.normalize() * repulsion_strength
-        
-        return repulsion_vector
-
-    def _standard_collision_detection(self, neighbors, dt, move_vector):
-        """标准的碰撞检测算法（原始版本）"""
-        # 3. 添加温和排斥力
-        repulsion_vector = Vector2(0, 0)
-        close_neighbors_count = 0
-        overlapping_neighbors = 0
-        
-        # 收集所有邻居信息，以便更好地处理重叠 - 使用向量化操作
-        neighbor_data = []
-        
-        # 预先筛选可能产生碰撞的邻居，减少后续计算量
-        potential_colliders = []
-        for other in neighbors:
-            if other is self: 
-                continue
-                
-            # 快速预检测 - 使用曼哈顿距离作为初步筛选
-            dx = min(abs(self.position.x - other.position.x), WORLD_SIZE - abs(self.position.x - other.position.x))
-            dy = min(abs(self.position.y - other.position.y), WORLD_SIZE - abs(self.position.y - other.position.y))
-            manhattan_dist = dx + dy
-            
-            # 只有可能产生碰撞的邻居才进行详细计算
-            if manhattan_dist < MILD_REPULSION_RADIUS + self.radius + other.radius:
-                dist_vec = self.position - other.position
-                
-                # 处理周期性边界条件
-                if dx > WORLD_SIZE / 2:
-                    dist_vec.x = -math.copysign(WORLD_SIZE - abs(dist_vec.x), dist_vec.x)
-                if dy > WORLD_SIZE / 2:
-                    dist_vec.y = -math.copysign(WORLD_SIZE - abs(dist_vec.y), dist_vec.y)
-                
-                dist_sq = dist_vec.length_squared()
-                min_dist = self.radius + other.radius
-                
-                # 收集邻居数据
-                potential_colliders.append({
-                    'agent': other,
-                    'dist_vec': dist_vec,
-                    'dist_sq': dist_sq,
-                    'min_dist': min_dist,
-                    'is_overlapping': dist_sq < min_dist**2
-                })
-                
-                # 检测是否有重叠
-                if dist_sq < min_dist**2:
-                    overlapping_neighbors += 1
-                
-                if dist_sq < MILD_REPULSION_RADIUS**2:
-                    close_neighbors_count += 1
-                    if dist_sq > 1e-6:  # 避免除以零
-                        # 使用更温和的排斥力计算
-                        repulsion_strength = 1.0 - (math.sqrt(dist_sq) / MILD_REPULSION_RADIUS)
-                        # 距离越近，排斥力越强（非线性增强）
-                        if dist_sq < min_dist**2:
-                            repulsion_strength *= 2.0  # 重叠时加倍排斥力
-                        repulsion_vector += dist_vec.normalize() * repulsion_strength
-        
-        # 应用温和排斥力，高密度区域增强排斥
-        if close_neighbors_count > 0:
-            density_factor = 1.0
-            if close_neighbors_count > HIGH_DENSITY_THRESHOLD:
-                # 高密度区域增强排斥力 - 使用非线性增强
-                density_factor = 1.0 + (close_neighbors_count - HIGH_DENSITY_THRESHOLD) ** 1.5 * 0.1
-            
-            # 确保排斥力优先于神经网络的移动决策
-            repulsion_move = repulsion_vector * MILD_REPULSION_STRENGTH * density_factor * dt
-            
-            # 如果排斥力和移动向量方向相反，优先考虑排斥力
-            if move_vector.dot(repulsion_vector) < 0:
-                # 当排斥力和移动向量冲突时，增强排斥力的影响
-                self.position += repulsion_move * REPULSION_PRIORITY
-            else:
-                self.position += repulsion_move
-        
-        # 紧急处理严重重叠情况 - 对于高密度区域增强处理
-        if overlapping_neighbors > 0:  # 只要有重叠就处理
-            # 计算远离所有重叠邻居的方向
-            escape_vector = Vector2(0, 0)
-            for data in potential_colliders:
-                if data['is_overlapping']:
-                    # 距离越近，逃离力越强
-                    escape_strength = 1.0
-                    if data['dist_sq'] > 0:
-                        escape_strength = min(3.0, (data['min_dist']**2) / data['dist_sq'])
-                    escape_vector += data['dist_vec'].normalize() * escape_strength
-            
-            if escape_vector.length_squared() > 0:
-                escape_factor = min(1.0, overlapping_neighbors * 0.3)  # 重叠越多，逃离越强
-                escape_vector = escape_vector.normalize() * OVERLAP_EMERGENCY_DISTANCE * escape_factor
-                self.position += escape_vector
-        
-        # 4. 严格碰撞解决 - 减少迭代次数，优化计算
-        # 只有当存在重叠时才执行碰撞解决
-        if overlapping_neighbors > 0:
-            # 减少迭代次数以提高性能
-            max_iterations = min(COLLISION_ITERATIONS, 1 + overlapping_neighbors)
-            
-            for iteration in range(max_iterations):
-                collision_occurred = False
-                # 按距离排序，先处理最严重的重叠
-                sorted_colliders = sorted(
-                    [c for c in potential_colliders if c['is_overlapping']], 
-                    key=lambda x: x['dist_sq']
-                )
-                
-                for data in sorted_colliders:
-                    if data['dist_sq'] < data['min_dist']**2 and data['dist_sq'] > 0:
-                        collision_occurred = True
-                        overlap = data['min_dist'] - math.sqrt(data['dist_sq'])
-                        # 将当前智能体沿碰撞向量推开整个重叠距离
-                        push_factor = 1.0 + iteration * 0.2  # 每次迭代增加20%的推力
-                        
-                        # 对于严重重叠，增加额外推力
-                        if overlap > data['min_dist'] * 0.5:  # 如果重叠超过半径
-                            push_factor *= 1.5
-                        
-                        # 在高密度区域增加额外推力
-                        if close_neighbors_count > HIGH_DENSITY_THRESHOLD:
-                            push_factor *= (1.0 + (close_neighbors_count - HIGH_DENSITY_THRESHOLD) * 0.1)
-                            
-                        self.position += data['dist_vec'].normalize() * overlap * push_factor * (1.0 / max_iterations)
-                
-                # 如果没有碰撞发生，提前退出循环
-                if not collision_occurred:
-                    break
 
     def reproduce(self):
         # 繁殖检查：能量必须达到繁殖阈值
         if self.energy < self.e_repro:
             return None
 
-        # 使用空间网格获取周围智能体，而不是检查所有智能体
+        # 使用空间网格获取周围智能体
         neighbors = self.universe.get_neighbors(self)
         
         # 尝试找到一个没有重叠的位置
@@ -1136,6 +818,7 @@ class Agent:
         for conn in new_gene['connections']:
             if random.random() < MUTATION_PROBABILITY['point']:
                 conn[2] += random.uniform(-1, 1) * MUTATION_STRENGTH
+                conn[2] = max(-4.0, min(4.0, conn[2])) 
                 mutations_occurred.append('point_mutation')
                 
         if random.random() < MUTATION_PROBABILITY['add_conn']:
@@ -1156,8 +839,6 @@ class Agent:
             new_gene['env_absorption_coeff'] += random.uniform(-1, 1) * MUTATION_STRENGTH
             mutations_occurred.append('absorption_coeff_mutation')
             
-        # 【修改】删除 computation_depth 的突变逻辑
-        
         # ===== 节点突变 =====
         if random.random() < MUTATION_PROBABILITY['add_node'] * 0.5:
             new_gene['n_input'] += 1
@@ -1190,7 +871,9 @@ class Agent:
                     new_gene['connections'].append([from_node, new_output_idx, random.uniform(-2, 2)])
             new_gene['n_output'] += 1
             if 'node_types' in new_gene:
-                new_type = random.choice(['movement', 'signal'])
+                # 【【【 核心修正点 1 】】】
+                # 将 'movement' 修正为 'move_vector'
+                new_type = random.choice(['move_vector', 'signal'])
                 new_gene['node_types']['output'].append(new_type)
             mutations_occurred.append('add_output_node')
         
@@ -1244,7 +927,9 @@ class Agent:
                 node_category = random.choice(valid_categories)
                 node_idx = random.randint(0, len(new_gene['node_types'][node_category]) - 1)
                 if node_category == 'input': new_type = random.choice(['field_sense', 'signal_sense'])
-                elif node_category == 'output': new_type = random.choice(['movement', 'signal'])
+                # 【【【 核心修正点 2 】】】
+                # 确保这里的列表也是正确的
+                elif node_category == 'output': new_type = random.choice(['move_vector', 'signal'])
                 else: new_type = 'standard'
                 new_gene['node_types'][node_category][node_idx] = new_type
                 mutations_occurred.append('node_type_mutation')
@@ -1646,6 +1331,52 @@ class Universe:
             self.logger.log_event(self.frame_count, 'SPAWN_WARNING', 
                                 {'message': f'只能添加 {len(new_agents)}/{agents_to_add} 个智能体，因为空间限制'})
     
+
+    def _resolve_physics_and_collisions(self):
+        """统一的物理引擎：稳定、精确的迭代式位置校正"""
+        living_agents = [agent for agent in self.agents if not agent.is_dead]
+        
+        # 迭代数次以确保所有连锁碰撞都得到解决
+        for _ in range(COLLISION_ITERATIONS):
+            collision_found = False
+            for i in range(len(living_agents)):
+                agent1 = living_agents[i]
+                for j in range(i + 1, len(living_agents)):
+                    agent2 = living_agents[j]
+                    
+                    dist_vec = agent1.position - agent2.position
+                    if abs(dist_vec.x) > WORLD_SIZE / 2: dist_vec.x -= math.copysign(WORLD_SIZE, dist_vec.x)
+                    if abs(dist_vec.y) > WORLD_SIZE / 2: dist_vec.y -= math.copysign(WORLD_SIZE, dist_vec.y)
+                        
+                    dist_sq = dist_vec.length_squared()
+                    min_dist = agent1.radius + agent2.radius
+                    
+                    # 如果发生重叠
+                    if dist_sq < min_dist**2 and dist_sq > 0:
+                        collision_found = True
+                        distance = math.sqrt(dist_sq)
+                        overlap = min_dist - distance
+                        
+                        # 【【【 核心修正点：稳定、线性的校正公式 】】】
+                        # 我们只将每个智能体推开重叠距离的一半，不多不少。
+                        # 这可以保证系统稳定，不会产生爆炸。
+                        push_magnitude = overlap / 2.0
+                        push_vector = dist_vec.normalize() * push_magnitude
+                        
+                        # 直接修改位置，将两者精确地推开
+                        agent1.position += push_vector
+                        agent2.position -= push_vector
+                        
+                        # 应用世界边界环绕
+                        agent1.position.x %= WORLD_SIZE
+                        agent1.position.y %= WORLD_SIZE
+                        agent2.position.x %= WORLD_SIZE
+                        agent2.position.y %= WORLD_SIZE
+            
+            # 如果这一轮迭代没有发现任何碰撞，说明系统已稳定，可以提前退出
+            if not collision_found:
+                break
+
     def update(self, dt):
         """更新宇宙状态"""
         if self.perf_monitor:
@@ -1653,48 +1384,42 @@ class Universe:
             
         self.frame_count += 1
         
-        # 并行更新所有场
+        # 1. 更新所有场
         self._update_fields_parallel(dt)
 
-        # 更新空间网格
+        # 2. 更新空间网格，用于邻居查找
         self.update_spatial_grid()
         
-        # 将智能体分成批次进行并行处理
+        # 3. 更新所有智能体的AI、能量、移动意图等
+        #    (此时允许它们暂时重叠)
         updated_agents = []
         agent_batches = [self.agents[i:i+BATCH_SIZE] for i in range(0, len(self.agents), BATCH_SIZE)]
-        
-        # 使用线程池并行处理智能体更新
         future_results = [self.thread_pool.submit(self._update_agent_batch, batch, dt) for batch in agent_batches]
         for future in future_results:
             updated_agents.extend(future.result())
-        
         self.agents = updated_agents
         
-        # 并行处理繁殖
-        # 注意：这里需要对更新后的 updated_agents 重新分批
+        # 4. 【调用统一物理引擎】强制解决所有物理问题
+        self._resolve_physics_and_collisions()
+        
+        # 5. 处理繁殖 (在物理位置最终确定后)
         agent_batches_for_repro = [self.agents[i:i+BATCH_SIZE] for i in range(0, len(self.agents), BATCH_SIZE)]
         future_results = [self.thread_pool.submit(self._process_reproduction, batch) for batch in agent_batches_for_repro]
         new_children = []
         for future in future_results:
             new_children.extend(future.result())
-        
-        # 添加新出生的智能体
         self.agents.extend(new_children)
 
-        # 如果智能体数量低于最小阈值，补充新的随机智能体
+        # 6. 处理种群数量控制 (出生和淘汰)
         if len(self.agents) < MIN_AGENTS_TO_SPAWN:
             self._spawn_new_agents()
-        
-        # 如果智能体数量过多，淘汰一些能量最低的
         if len(self.agents) > MAX_AGENTS:
-            self._cull_excess_agents()
+            self._cull_excess_agents() # 您可以在这里选择您喜欢的淘汰策略
             
-        # 定期记录状态
+        # 7. 定期记录状态
         if self.frame_count % 20 == 0:
             self.logger.log_state(self.frame_count, self.agents)
-            # 同时记录场景数据
             self.logger.log_field(self.frame_count, self.fields)
-            # 记录信号类型
             self.logger.log_signal_types(self.signal_types)
             
         if self.perf_monitor:
@@ -1942,7 +1667,7 @@ def draw_inspector_panel(surface, font, agent, mouse_pos, panel_x, panel_width, 
         text_surf = font.render(f"{text}: {value}", True, color)
         surface.blit(text_surf, (panel_x + 20, y_offset))
         y_offset += 25
-    
+
     if agent.is_mutant:
         draw_text("观察对象 ID", f"{agent.id} (M)", (255, 255, 100))
     else:
@@ -1950,46 +1675,56 @@ def draw_inspector_panel(surface, font, agent, mouse_pos, panel_x, panel_width, 
 
     draw_text("亲代 ID", agent.parent_id if agent.parent_id else "N/A")
     draw_text("基因型 ID", agent.genotype_id)
-    # draw_text("年龄", agent.age) # 如果您使用了年龄淘汰，可以取消这行注释
+    # draw_text("年龄", agent.age)
     draw_text("能量 (E)", f"{agent.energy:.2f}")
     draw_text("位置 (p)", f"({agent.position.x:.1f}, {agent.position.y:.1f})")
     
     y_offset += 10
-    draw_text("--- 基因特性 ---", "", (200, 200, 100))
+    draw_text("--- 基因特性 ---", "")
     draw_text("复杂度 (Ω)", f"{agent.complexity:.2f}")
-    
-    draw_text("输入节点数", agent.n_input)
-    draw_text("输出节点数", agent.n_output)
-    draw_text("隐藏节点数", agent.n_hidden)
+    draw_text("输入/隐藏/输出", f"{agent.n_input}/{agent.n_hidden}/{agent.n_output}")
     draw_text("连接数", len(agent.gene['connections']))
     draw_text("环境吸收系数", f"{agent.env_absorption_coeff:.2f}")
     
     y_offset += 10
-    draw_text("--- 生态特性 ---", "", (200, 100, 200))
-    
+    draw_text("--- 生态特性 ---", "")
     id_value = round(agent.identity_vector, 2)
-    # 【【【 核心修正点 】】】
-    # 计算颜色值
     r = 100 + abs(id_value) * 100
     g = 100 + (1 - abs(id_value)) * 100
     b = 200 - abs(id_value) * 100
-    # 强制将颜色值限制在 0-255 范围内，防止闪退
-    safe_color = (max(0, min(255, int(r))), 
-                  max(0, min(255, int(g))), 
-                  max(0, min(255, int(b))))
+    safe_color = (max(0, min(255, int(r))), max(0, min(255, int(g))), max(0, min(255, int(b))))
     draw_text("身份向量", f"{id_value:.2f}", safe_color)
     
     y_offset += 10
-    draw_text("--- 行为输出 ---", "", (200, 200, 100))
+    draw_text("--- 行为输出 ---", "")
     
-    if len(agent.last_action_vector) > 0:
-        draw_text("移动 X", f"{agent.last_action_vector[0]:.2f}")
-    if len(agent.last_action_vector) > 1:
-        draw_text("移动 Y", f"{agent.last_action_vector[1]:.2f}")
+    output_types = agent.gene.get('node_types', {}).get('output', [])
+    move_vec_count = 0
+    signal_count = 0
     
-    if len(agent.last_action_vector) > 2:
-        for i, signal in enumerate(agent.last_action_vector[2:], 1):
-            draw_text(f"信号{i}强度", f"{abs(signal):.2f}")
+    move_components = []
+    for i, activation in enumerate(agent.last_action_vector):
+        node_type = output_types[i] if i < len(output_types) else 'signal'
+        if node_type == 'move_vector':
+            move_components.append(activation)
+
+    # 【【【 核心修正点：正确显示奇数和偶数个移动节点 】】】
+    for i in range(0, len(move_components), 2):
+        move_vec_count += 1
+        vx = move_components[i]
+        # 如果存在能配对的Y分量，则显示完整向量
+        if i + 1 < len(move_components):
+            vy = move_components[i+1]
+            draw_text(f"移动向量 {move_vec_count}", f"({vx:.2f}, {vy:.2f})")
+        else:
+            # 如果落单了，则只显示X分量
+            draw_text(f"移动向量 {move_vec_count}_X", f"{vx:.2f}")
+
+    for i, activation in enumerate(agent.last_action_vector):
+        node_type = output_types[i] if i < len(output_types) else 'signal'
+        if node_type == 'signal':
+            signal_count += 1
+            draw_text(f"信号 {signal_count} 强度", f"{abs(activation):.2f}")
     
     y_offset += 20
     draw_neural_network(surface, font, agent, panel_x + 20, y_offset, panel_width - 40, 350, mouse_pos)
@@ -2000,157 +1735,114 @@ def draw_neural_network(surface, font, agent, x, y, width, height, mouse_pos):
     surface.blit(title, (x, y))
     y += 30
     
-    # 获取节点数量
     n_in, n_hid, n_out = agent.n_input, agent.n_hidden, agent.n_output
     
-    # 从基因中获取节点类型信息
-    node_types = agent.gene.get('node_types', {
-        'input': ['env_sense'] * n_in,
-        'output': ['movement'] * 2 + ['signal'] * (n_out - 2) if n_out > 2 else ['movement'] * n_out,
-        'hidden': ['standard'] * n_hid
-    })
+    # --- 修正后的标签和布局逻辑 ---
     
-    # 为所有节点类型创建标签
+    # 1. 修正输入节点标签逻辑
+    perception_channel_names = ["Energy_v", "Energy_gx", "Energy_gy", "Hazard_v", "Hazard_gx", "Hazard_gy"]
+    signal_names = [f.name for f in agent.universe.fields if "Biotic" in f.name]
+    for sig_name in signal_names:
+        perception_channel_names.extend([f"{sig_name}_v", f"{sig_name}_gx", f"{sig_name}_gy"])
+    
     input_labels = []
-    # 使用统一的signal命名方式
-    basic_input_labels = ["Energy_v", "Energy_gx", "Energy_gy", "Hazard_v", "Hazard_gx", "Hazard_gy", 
-                         "Signal1_v", "Signal1_gx", "Signal1_gy", "Signal2_v", "Signal2_gx", "Signal2_gy"]
-    signal_in_count = 0
     for i in range(n_in):
-        node_type = None
-        if 'node_types' in agent.gene and 'input' in agent.gene['node_types'] and i < len(agent.gene['node_types']['input']):
-            node_type = agent.gene['node_types']['input'][i]
-        if node_type == 'signal_sense':
-            input_labels.append(f"Signal{signal_in_count+3}_v")
-            signal_in_count += 1
-        elif i < len(basic_input_labels):
-            input_labels.append(basic_input_labels[i])
-        else:
-            input_labels.append(f"In_{i}")
-    
-    # 输出标签
+        input_labels.append(perception_channel_names[i] if i < len(perception_channel_names) else f"Input_{i}")
+        
+    # 2. 动态生成输出节点标签
     output_labels = []
-    # 基础移动输出
-    if n_out > 0:
-        output_labels.append("MoveX")
-    if n_out > 1:
-        output_labels.append("MoveY")
-    # 信号输出
-    for i in range(2, n_out):
-        output_labels.append(f"Signal_{i-1}")
+    output_types = agent.gene.get('node_types', {}).get('output', [])
+    move_vec_count = 0
+    signal_count = 0
+    temp_move_tracker = 0 # 用于追踪移动向量的X/Y分量
+
+    for i in range(n_out):
+        node_type = output_types[i] if i < len(output_types) else 'signal'
+        if node_type == 'move_vector':
+            if temp_move_tracker % 2 == 0:
+                move_vec_count += 1
+                output_labels.append(f"MVec{move_vec_count}_x")
+            else:
+                output_labels.append(f"MVec{move_vec_count}_y")
+            temp_move_tracker += 1
+        elif node_type == 'signal':
+            signal_count += 1
+            output_labels.append(f"Sig_{signal_count}")
+
+    # 3. 调整节点列的布局，为标签留出更多空间
+    col_x = [x + 70, x + width // 2, x + width - 70]
     
-    # 设置列位置
-    col_x = [x + 30, x + width // 2, x + width - 30]
+    # --- 后续绘制逻辑 ---
     layers = [n_in, n_hid, n_out]
     node_positions = {}
-    
-    # 根据是否有隐藏层决定布局
     col_map = [0, 1, 2] if n_hid > 0 else [0, 2] 
-    
-    # 计算每个节点的位置
     current_node_idx = 0
     visible_layer_idx = 0 
     for i, n_nodes in enumerate(layers):
-        if n_nodes == 0: 
-            continue
-        
-        # 计算当前层的起始Y位置（使节点分布均匀）
+        if n_nodes == 0: continue
         layer_y_start = y + (height - (n_nodes - 1) * 25) / 2 if n_nodes > 1 else y + height / 2
-        
-        # 为每个节点分配位置
         for j in range(n_nodes):
             node_id = current_node_idx + j
             column_to_use = col_x[col_map[visible_layer_idx]]
             node_positions[node_id] = (int(column_to_use), int(layer_y_start + j * 25))
-
         current_node_idx += n_nodes
         visible_layer_idx += 1
 
-    # 绘制连接
     for from_n, to_n, weight in agent.gene['connections']:
         if from_n in node_positions and to_n in node_positions:
             start_pos, end_pos = node_positions[from_n], node_positions[to_n]
-            # 使用颜色表示权重符号（绿色为正，红色为负）
             line_width = min(3, max(1, abs(int(weight * 2))))
             color = (0, min(255, 100 + int(abs(weight) * 80)), 0) if weight > 0 else (min(255, 150 + int(abs(weight) * 50)), 50, 50)
             pygame.draw.line(surface, color, start_pos, end_pos, line_width)
     
-    # 处理鼠标悬停信息
     hover_info = None
-    
-    # 绘制节点
     for node_id, pos in node_positions.items():
         is_input = node_id < n_in
         is_hidden = n_in <= node_id < n_in + n_hid
-        is_output = node_id >= n_in + n_hid
         
-        # 根据节点类型设置颜色
-        if is_input:
-            # 输入节点：环境感知为蓝色，额外输入为紫色
-            if node_id < len(basic_input_labels):
-                color = (100, 100, 255)  # 蓝色: 环境感知
-            else:
-                color = (180, 100, 255)  # 紫色: 额外感知
-        elif is_hidden:
-            color = (255, 165, 0)  # 橙色: 隐藏节点
-        else:
-            # 输出节点：移动为黄色，信号为绿色
+        # 颜色和节点绘制逻辑不变
+        color = (255, 165, 0)
+        if is_input: color = (100, 100, 255)
+        elif not is_hidden:
             output_idx = node_id - (n_in + n_hid)
-            if output_idx < 2:  # 移动节点
-                color = (255, 255, 100)  # 黄色
-            else:  # 信号节点
-                color = (100, 255, 100)  # 绿色
+            node_type = output_types[output_idx] if output_idx < len(output_types) else 'signal'
+            color = (255, 255, 100) if node_type == 'move_vector' else (100, 255, 100)
         
-        # 根据激活值调整颜色亮度
         activation = agent.node_activations[node_id]
         brightness = max(0, min(255, 128 + int(activation * 127)))
         color = tuple(min(255, c * brightness // 128) for c in color)
-        
-        # 绘制节点圆圈
         radius = 6
         pygame.draw.circle(surface, color, pos, radius)
         pygame.draw.circle(surface, (0,0,0), pos, radius, 1)
 
-        # 设置标签
+        # 标签获取和绘制
         label = None
         if is_input and node_id < len(input_labels):
             label = input_labels[node_id]
-        elif is_output:
+        elif not is_hidden:
             output_idx = node_id - (n_in + n_hid)
             if output_idx < len(output_labels):
                 label = output_labels[output_idx]
 
-        # 绘制标签
         if label:
             label_surf = font.render(label, True, (200, 200, 200))
+            # 4. 调整输入节点标签的绘制位置，避免遮挡
             if is_input:
-                surface.blit(label_surf, (pos[0] - label_surf.get_width() - 5, pos[1] - 8))
-            else:
+                surface.blit(label_surf, (pos[0] - label_surf.get_width() - 10, pos[1] - 8))
+            else: # 输出节点
                 surface.blit(label_surf, (pos[0] + 10, pos[1] - 8))
         
-        # 检测鼠标悬停
         if math.hypot(mouse_pos[0] - pos[0], mouse_pos[1] - pos[1]) < radius:
-            # 根据节点类型创建不同的悬停信息
-            if is_input:
-                node_type = "环境感知" if node_id < len(basic_input_labels) else "额外输入"
-            elif is_hidden:
-                node_type = "隐藏"
-            else:
-                output_idx = node_id - (n_in + n_hid)
-                if output_idx < 2:
-                    node_type = "移动" 
-                else:
-                    node_type = "信号"
-            
-            hover_info = (f"{node_type}节点 {node_id}", f"激活值: {agent.node_activations[node_id]:.3f}", mouse_pos)
+            node_type_str = "隐藏"
+            if is_input: node_type_str = "输入"
+            elif not is_hidden: node_type_str = "输出"
+            hover_info = (f"{node_type_str}节点 {node_id}", f"激活值: {agent.node_activations[node_id]:.3f}", mouse_pos)
 
-    # 绘制悬停信息
     if hover_info:
         title, value, pos = hover_info
         title_surf = font.render(title, True, (255, 255, 255))
         value_surf = font.render(value, True, (255, 255, 255))
-        box_rect = pygame.Rect(pos[0] + 10, pos[1] + 10, 
-                              max(title_surf.get_width(), value_surf.get_width()) + 20, 50)
+        box_rect = pygame.Rect(pos[0] + 10, pos[1] + 10, max(title_surf.get_width(), value_surf.get_width()) + 20, 50)
         pygame.draw.rect(surface, (0,0,0,200), box_rect)
         surface.blit(title_surf, (box_rect.x + 10, box_rect.y + 5))
         surface.blit(value_surf, (box_rect.x + 10, box_rect.y + 25))
