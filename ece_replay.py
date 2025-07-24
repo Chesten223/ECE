@@ -200,12 +200,13 @@ class ReplayAgent:
         self.position = Vector2(agent_data['pos_x'], agent_data['pos_y'])
         self.n_hidden = agent_data['n_hidden']
         self.n_connections = agent_data['n_connections']
-        self.computation_depth = agent_data['computation_depth']
+        # 【修改点】删除这一行
+        # self.computation_depth = agent_data['computation_depth']
         try:
             self.gene = json.loads(agent_data['gene_string'].replace("'", '"'))
         except:
             self.gene = {"connections": []}
-        self.radius = 2.0  # 保持与原模拟相同的半径
+        self.radius = 2.0
         self.is_selected = False
         
     def draw(self, surface, camera):
@@ -1011,7 +1012,8 @@ class ReplayController:
                     'pos_y': row['pos_y'],
                     'n_hidden': row['n_hidden'],
                     'n_connections': row['n_connections'],
-                    'computation_depth': row['computation_depth'],
+                    # 【修改点】删除这一行
+                    # 'computation_depth': row['computation_depth'],
                     'gene_string': row['gene_string']
                 }
                 self.frame_data[frame_int].append(agent_data)
@@ -1043,7 +1045,7 @@ class ReplayController:
             
             # 添加信号场到映射
             for i, signal_type in enumerate(self.signal_types):
-                field_name_to_idx[signal_type] = i + 2  # 基础场后面是信号场
+                field_name_to_idx[signal_type] = i + 2
             
             # 使用更高效的方式处理场景数据
             field_groups = field_df.groupby('frame')
@@ -1055,27 +1057,21 @@ class ReplayController:
                     field_type = row['field_type']
                     encoded_data = row['data']
                     
-                    # 查找对应的场对象索引
                     field_idx = field_name_to_idx.get(field_type)
                     if field_idx is not None and field_idx < len(self.fields):
-                        # 存储此帧的场数据
                         frame_fields[field_idx] = encoded_data
                 
-                # 将此帧的场数据存入字典
                 if frame_fields:
                     self.field_data[frame_int] = frame_fields
         
-        # 获取所有帧号并排序
         self.frames = sorted(list(self.frame_data.keys()))
         self.current_frame_idx = 0
         
-        # 为第一帧设置场数据
         if self.frames and self.field_data:
             self.update_field_data_for_frame(self.get_current_frame())
         
         print(f"数据加载完成，共有{len(self.frames)}帧，耗时{time.time() - start_time:.2f}秒")
         
-        # 初始化事件列表
         self.update_event_list()
         
     def update_signal_types(self):
@@ -1457,7 +1453,6 @@ class ReplayController:
                     draw_agent_info("位置", f"({selected_agent.position.x:.1f}, {selected_agent.position.y:.1f})")
                     draw_agent_info("隐藏节点数", selected_agent.n_hidden)
                     draw_agent_info("连接数", selected_agent.n_connections)
-                    draw_agent_info("计算深度", selected_agent.computation_depth)
                     
                     # 如果是变异体，特殊标记
                     if selected_agent.is_mutant:
